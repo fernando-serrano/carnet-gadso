@@ -1,10 +1,10 @@
 # Flujo Emisión de Carnet SUCAMEC
 
-Este workspace ahora incluye un flujo base para **emisión de carnet** que reutiliza la lógica del login del flujo original y deja un punto de extensión para implementar los pasos posteriores.
+Este workspace incluye un flujo base para emisión de carnet que replica la lógica automática de login del flujo original, incluyendo OCR de captcha y orquestación opcional con workers en modo scheduled.
 
 ## Estructura creada
 
-- `carnet_emision.py`: script base del nuevo flujo (hasta login)
+- `carnet_emision.py`: script del flujo de carnet con login automático + OCR + workers
 - `run_carnet_emision.bat`: ejecuta el flujo en Windows
 - `logs/`: salida de logs por ejecución
 - `data/`: insumos de datos para el flujo
@@ -22,8 +22,17 @@ El script usa primero variables específicas `CARNET_*` y si no existen hace fal
 - `CARNET_CLAVE_SEL` (fallback `CLAVE_SEL`)
 - `CARNET_URL_LOGIN` (default URL login SEL)
 - `CARNET_HEADLESS` (`0` o `1`)
+- `CARNET_OCR_MAX_INTENTOS` (default `6`)
 - `HOLD_BROWSER_OPEN` (`0` o `1`)
 - `RUN_MODE` (`manual` o `scheduled`)
+- `CARNET_GRUPOS` (default `SELVA,JV`)
+- `MAX_LOGIN_RETRIES_PER_GROUP` (default `12`)
+- `LOGIN_VALIDATION_TIMEOUT_MS` (default `6000`)
+
+Variables de workers (modo scheduled):
+
+- `SCHEDULED_MULTIWORKER` (`1` activa orquestador)
+- `SCHEDULED_WORKERS` (cantidad de workers, default `2`, máximo `4`)
 
 ## Ejecución
 
@@ -48,7 +57,10 @@ Actualmente el flujo implementa:
 3. Navegación a login SUCAMEC.
 4. Activación de pestaña de autenticación tradicional.
 5. Carga de credenciales.
-6. Resolución manual de captcha.
+6. Resolución automática de captcha con OCR (easyocr).
 7. Validación de login por señales de UI.
+8. Reintentos de login por grupo.
+9. Orquestación de workers en modo scheduled (subprocesos aislados).
+10. Guardado de logs en archivo tanto en ejecución directa como desde `.bat`.
 
 Después del login exitoso, queda marcado el punto para implementar la lógica específica de emisión de carnet.
