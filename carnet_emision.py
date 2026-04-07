@@ -38,6 +38,7 @@ DEFAULT_GSHEET_URL = (
 )
 
 DEFAULT_GSHEET_COMPARE_URL = ""
+DEFAULT_GSHEET_THIRD_URL = ""
 
 CREDENCIALES_JV = {
     "tipo_documento_valor": os.getenv("CARNET_TIPO_DOC", os.getenv("TIPO_DOC", "RUC")).strip(),
@@ -1023,6 +1024,9 @@ def ejecutar_flujo_secundario() -> int:
             url_base = str(os.getenv("CARNET_GSHEET_URL", DEFAULT_GSHEET_URL) or DEFAULT_GSHEET_URL).strip()
             esquema_base = [
                 ("dni", ["dni"]),
+                ("apellido_paterno", ["apellido paterno", "apellido_paterno", "ap paterno"]),
+                ("apellido_materno", ["apellido materno", "apellido_materno", "ap materno"]),
+                ("nombres", ["nombres", "nombre"]),
                 ("departamento", ["indicar el departamento donde labora o donde postuló", "indicar el departamento donde labora o donde postulo", "departamento"]),
                 ("puesto", ["puesto"]),
             ]
@@ -1039,6 +1043,17 @@ def ejecutar_flujo_secundario() -> int:
                     ("fecha_tramite", ["fecha tramite", "fecha_tramite", "fechatramite", "fecha trámite"]),
                 ]
                 imprimir_muestra_google_sheet_desde_url(logger, url_compare, "HOJA_COMPARACION", max_rows=max_rows, esquema_columnas=esquema_compare)
+
+            url_third = str(os.getenv("CARNET_GSHEET_THIRD_URL", DEFAULT_GSHEET_THIRD_URL) or "").strip()
+            if url_third:
+                esquema_third = [
+                    ("ruc", ["ruc"]),
+                    ("solicitado_por", ["solicitado por", "solicitado_por"]),
+                    ("copia_secuencia_pago", ["copia de secuencia de pago", "copia secuencia de pago", "secuencia de pago"]),
+                    ("dni", ["dni"]),
+                    ("apellidos_y_nombre", ["apellidos y nombre", "apellidos y nombres", "apellido y nombre", "nombres y apellidos"]),
+                ]
+                imprimir_muestra_google_sheet_desde_url(logger, url_third, "HOJA_TERCERA", max_rows=max_rows, esquema_columnas=esquema_third)
         except Exception as exc:
             logger.warning("No se pudo leer Google Sheet de muestra: %s", exc)
 
