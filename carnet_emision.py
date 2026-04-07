@@ -6,6 +6,7 @@ import sys
 import time
 import csv
 import io
+import mimetypes
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -13,6 +14,7 @@ import logging
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 import unicodedata
+import importlib
 
 from dotenv import load_dotenv
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -39,6 +41,9 @@ DEFAULT_GSHEET_URL = (
 
 DEFAULT_GSHEET_COMPARE_URL = ""
 DEFAULT_GSHEET_THIRD_URL = ""
+DEFAULT_DRIVE_ROOT_FOLDER_ID = ""
+DEFAULT_DRIVE_CREDENTIALS_JSON = ""
+DEFAULT_DRIVE_VALIDATE_ON_START = "1"
 
 CREDENCIALES_JV = {
     "tipo_documento_valor": os.getenv("CARNET_TIPO_DOC", os.getenv("TIPO_DOC", "RUC")).strip(),
@@ -680,6 +685,191 @@ def _resolver_columna(fieldnames: list, candidatos: list[str]) -> str | None:
     return None
 
 
+def _drive_root_folder_id() -> str:
+    return str(
+        os.getenv(
+            "DRIVE_ROOT_FOLDER_ID",
+            os.getenv("CARNET_DRIVE_ROOT_FOLDER_ID", DEFAULT_DRIVE_ROOT_FOLDER_ID),
+        )
+        or ""
+    ).strip()
+
+
+def _drive_service():
+    try:
+        service_account = importlib.import_module("google.oauth2.service_account")
+        google_build = importlib.import_module("googleapiclient.discovery").build
+    except Exception as exc:
+        raise Exception("Faltan dependencias de Google Drive API. Instala google-api-python-client y google-auth") from exc
+
+    credentials_path = str(os.getenv("DRIVE_CREDENTIALS_JSON", DEFAULT_DRIVE_CREDENTIALS_JSON) or "").strip()
+    if not credentials_path:
+        raise Exception("Falta DRIVE_CREDENTIALS_JSON en .env")
+
+    scopes = ["https://www.googleapis.com/auth/drive.readonly"]
+    creds = service_account.Credentials.from_service_account_file(credentials_path, scopes=scopes)
+    return google_build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+def _drive_list_children(service, folder_id: str) -> list[dict]:
+    query = f"'{folder_id}' in parents and trashed = false"
+    response = service.files().list(
+        q=query,
+        spaces="drive",
+        fields="files(id, name, mimeType, parents)",
+        pageSize=1000,
+        includeItemsFromAllDrives=True,
+        supportsAllDrives=True,
+    ).execute()
+    return response.get("files", []) or []
+
+
+def _drive_get_folder_metadata(service, folder_id: str) -> dict:
+    return service.files().get(
+        fileId=folder_id,
+        fields="id, name, mimeType, parents, trashed",
+        supportsAllDrives=True,
+    ).execute()
+
+
+def _drive_find_child_folder(service, parent_id: str, folder_name: str) -> dict | None:
+    target = _normalizar_columna(folder_name)
+    for item in _drive_list_children(service, parent_id):
+        if item.get("mimeType") == "application/vnd.google-apps.folder" and _normalizar_columna(item.get("name", "")) == target:
+            return item
+    return None
+
+
+def _drive_find_dni_folder(service, root_folder_id: str, dni: str) -> dict | None:
+    root_children = _drive_list_children(service, root_folder_id)
+    # Primero intenta encontrar el DNI directamente bajo la raíz.
+    target = _normalizar_columna(dni)
+    for item in root_children:
+        if item.get("mimeType") == "application/vnd.google-apps.folder" and _normalizar_columna(item.get("name", "")) == target:
+            return item
+
+    # Si no existe directo, intenta año/mes dinámico por la fecha actual.
+    fecha_hoy = datetime.now()
+    year_name = str(fecha_hoy.year)
+    month_name = f"{fecha_hoy.month:02d}"
+    year_folder = _drive_find_child_folder(service, root_folder_id, year_name)
+    if year_folder:
+        month_folder = _drive_find_child_folder(service, year_folder["id"], month_name)
+        if month_folder:
+            for item in _drive_list_children(service, month_folder["id"]):
+                if item.get("mimeType") == "application/vnd.google-apps.folder" and _normalizar_columna(item.get("name", "")) == target:
+                    return item
+    return None
+
+
+def _drive_list_document_names(service, folder_id: str) -> list[str]:
+    files = _drive_list_children(service, folder_id)
+    return [f.get("name", "") for f in files if f.get("mimeType") != "application/vnd.google-apps.folder"]
+
+
+def validar_drive_acceso_raiz(logger: logging.Logger, folder_id: str | None = None, max_items: int = 10) -> bool:
+    """Valida que la service account pueda leer la carpeta raíz compartida y sus hijos visibles."""
+    root_folder_id = str(folder_id or _drive_root_folder_id()).strip()
+    if not root_folder_id:
+        raise Exception("Falta DRIVE_ROOT_FOLDER_ID o CARNET_DRIVE_ROOT_FOLDER_ID en .env")
+
+    service = _drive_service()
+    metadata = _drive_get_folder_metadata(service, root_folder_id)
+    logger.info(
+        "[DRIVE] Carpeta raíz accesible: nombre=%s | id=%s | mimeType=%s",
+        metadata.get("name", ""),
+        metadata.get("id", ""),
+        metadata.get("mimeType", ""),
+    )
+
+    children = _drive_list_children(service, root_folder_id)
+    logger.info("[DRIVE] Elementos visibles en la carpeta raíz: %s", len(children))
+    limite = max(1, int(max_items or 10))
+    for idx, item in enumerate(children[:limite], start=1):
+        logger.info(
+            "[DRIVE] Hijo %s | nombre=%s | mimeType=%s | id=%s",
+            idx,
+            item.get("name", ""),
+            item.get("mimeType", ""),
+            item.get("id", ""),
+        )
+
+    if not children:
+        logger.warning("[DRIVE] La carpeta raíz es accesible, pero no devolvió hijos visibles")
+        return False
+
+    return True
+
+
+def validar_drive_por_dni(logger: logging.Logger, dni: str, required_names: list[str] | None = None) -> bool:
+    """Valida que exista la carpeta del DNI y que exponga documentos visibles dentro."""
+    root_folder_id = _drive_root_folder_id()
+    if not root_folder_id:
+        raise Exception("Falta DRIVE_ROOT_FOLDER_ID o CARNET_DRIVE_ROOT_FOLDER_ID en .env")
+
+    service = _drive_service()
+    logger.info("[DRIVE][%s] Validando acceso en carpeta raíz: %s", dni, root_folder_id)
+    dni_folder = _drive_find_dni_folder(service, root_folder_id, dni)
+    if not dni_folder:
+        logger.warning("[DRIVE][%s] No se encontró carpeta DNI", dni)
+        return False
+
+    logger.info(
+        "[DRIVE][%s] Carpeta DNI encontrada: %s (%s)",
+        dni,
+        dni_folder.get("name", ""),
+        dni_folder.get("id", ""),
+    )
+    names = _drive_list_document_names(service, dni_folder["id"])
+    logger.info("[DRIVE][%s] Documentos visibles en carpeta: %s", dni, ", ".join(names) if names else "<vacío>")
+
+    if not required_names:
+        return bool(names)
+
+    names_norm = [_normalizar_columna(x) for x in names]
+    faltantes = []
+    for required in required_names:
+        if not any(_normalizar_columna(required) in n for n in names_norm):
+            faltantes.append(required)
+
+    if faltantes:
+        logger.warning("[DRIVE][%s] Faltan documentos: %s", dni, ", ".join(faltantes))
+        return False
+
+    logger.info("[DRIVE][%s] Validación OK: carpeta accesible y documentos requeridos presentes", dni)
+    return True
+
+
+def prevalidar_drive_desde_hoja(logger: logging.Logger, max_rows: int = 5) -> None:
+    """Prevalida Drive por los primeros DNIs detectados en la hoja base, sin interrumpir el flujo."""
+    if _as_bool_env("DRIVE_VALIDATE_ON_START", default=True) is False:
+        return
+
+    try:
+        validar_drive_acceso_raiz(logger, max_items=max_rows)
+        url_base = str(os.getenv("CARNET_GSHEET_URL", DEFAULT_GSHEET_URL) or DEFAULT_GSHEET_URL).strip()
+        rows, fields = _leer_google_sheet_rows(url_base, logger)
+        col_dni = _resolver_columna(fields, ["dni"])
+        if not col_dni:
+            logger.warning("[DRIVE] No se encontró columna DNI en la hoja base")
+            return
+
+        seen = 0
+        for row in rows:
+            dni = str(row.get(col_dni, "") or "").strip()
+            if not dni:
+                continue
+            seen += 1
+            try:
+                validar_drive_por_dni(logger, dni)
+            except Exception as exc:
+                logger.warning("[DRIVE][%s] Falló validación: %s", dni, exc)
+            if seen >= max(1, int(max_rows or 5)):
+                break
+    except Exception as exc:
+        logger.warning("[DRIVE] No se pudo ejecutar prevalidación de Drive: %s", exc)
+
+
 def comparar_dnis_entre_hojas(logger: logging.Logger, max_rows: int = 5) -> None:
     """Cruza dos hojas de Google Sheets por DNI y muestra coincidencias / diferencias."""
     url_base = str(os.getenv("CARNET_GSHEET_URL", DEFAULT_GSHEET_URL) or DEFAULT_GSHEET_URL).strip()
@@ -1057,6 +1247,9 @@ def ejecutar_flujo_secundario() -> int:
         except Exception as exc:
             logger.warning("No se pudo leer Google Sheet de muestra: %s", exc)
 
+    # Validación Drive no invasiva: solo logea acceso y nombres visibles de documentos.
+    prevalidar_drive_desde_hoja(logger, max_rows=max(1, _safe_int_env("CARNET_SHEET_SAMPLE_ROWS", 5)))
+
     if _as_bool_env("CARNET_SHEET_CROSSCHECK_ONLY", default=False):
         try:
             comparar_dnis_entre_hojas(
@@ -1070,6 +1263,11 @@ def ejecutar_flujo_secundario() -> int:
 
     if _as_bool_env("CARNET_SHEET_DEMO_ONLY", default=False):
         logger.info("CARNET_SHEET_DEMO_ONLY=1 -> finaliza tras imprimir muestra del Google Sheet")
+        return 0
+
+    if _as_bool_env("DRIVE_VALIDATE_ONLY", default=False):
+        validar_drive_acceso_raiz(logger)
+        logger.info("DRIVE_VALIDATE_ONLY=1 -> finaliza tras validar la carpeta raíz de Drive")
         return 0
 
     grupos = resolver_grupos_objetivo()

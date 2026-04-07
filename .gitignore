@@ -28,3 +28,4 @@ htmlcov/
 
 # Sensitive config
 .env
+secrets/*.json

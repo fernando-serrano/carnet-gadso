@@ -36,6 +36,13 @@ Variables de workers (modo scheduled):
 
 ## Ejecución
 
+Instalación de dependencias:
+
+```bash
+pip install -r requirements.txt
+python -m playwright install chromium
+```
+
 En Windows:
 
 ```bat
