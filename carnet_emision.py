@@ -12,6 +12,7 @@ from pathlib import Path
 import logging
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
+import unicodedata
 
 from dotenv import load_dotenv
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -35,6 +36,8 @@ DEFAULT_GSHEET_URL = (
     "https://docs.google.com/spreadsheets/d/1I5CmLAxZxA5gIlHz_m5kDPTaHIs1yOEWvy7tN4Ia2hs/"
     "edit?pli=1&gid=999619533#gid=999619533"
 )
+
+DEFAULT_GSHEET_COMPARE_URL = ""
 
 CREDENCIALES_JV = {
     "tipo_documento_valor": os.getenv("CARNET_TIPO_DOC", os.getenv("TIPO_DOC", "RUC")).strip(),
@@ -490,7 +493,12 @@ def validar_credenciales_configuradas(credenciales: dict, etiqueta: str):
 
 
 def _normalizar_columna(nombre: str) -> str:
-    return str(nombre or "").strip().lower()
+    base = str(nombre or "").strip().lower()
+    base = unicodedata.normalize("NFKD", base)
+    base = "".join(c for c in base if not unicodedata.combining(c))
+    base = base.replace("ñ", "n")
+    base = re.sub(r"\s+", " ", base)
+    return base
 
 
 def _build_google_sheet_csv_url(sheet_url: str) -> str:
@@ -539,24 +547,24 @@ def imprimir_muestra_google_sheet(logger: logging.Logger, max_rows: int = 5) -> 
         return
 
     col_dni = None
-    col_departamento = None
-    col_puesto = None
+    col_estado = None
+    col_observacion = None
     for col in (reader.fieldnames or []):
         ncol = _normalizar_columna(col)
         if col_dni is None and ncol == "dni":
             col_dni = col
-        if col_departamento is None and "indicar el departamento donde labora" in ncol:
-            col_departamento = col
-        if col_puesto is None and ncol == "puesto":
-            col_puesto = col
+        if col_estado is None and ncol == "estado":
+            col_estado = col
+        if col_observacion is None and (ncol == "observacion" or "observ" in ncol):
+            col_observacion = col
 
     faltantes = []
     if not col_dni:
         faltantes.append("DNI")
-    if not col_departamento:
-        faltantes.append("Indicar el departamento donde Labora o donde postuló")
-    if not col_puesto:
-        faltantes.append("PUESTO")
+    if not col_estado:
+        faltantes.append("ESTADO")
+    if not col_observacion:
+        faltantes.append("OBSERVACIÓN")
     if faltantes:
         raise Exception(f"No se encontraron columnas esperadas en Google Sheet: {faltantes}")
 
@@ -569,17 +577,186 @@ def imprimir_muestra_google_sheet(logger: logging.Logger, max_rows: int = 5) -> 
     mostrados = 0
     for row in rows:
         dni = str(row.get(col_dni, "") or "").strip()
-        dep = str(row.get(col_departamento, "") or "").strip()
-        puesto = str(row.get(col_puesto, "") or "").strip()
-        if not dni and not dep and not puesto:
+        estado = str(row.get(col_estado, "") or "").strip()
+        observacion = str(row.get(col_observacion, "") or "").strip()
+        if not dni and not estado and not observacion:
             continue
         mostrados += 1
-        logger.info("Muestra %s | DNI=%s | Departamento=%s | Puesto=%s", mostrados, dni, dep, puesto)
+        logger.info("Muestra %s | DNI=%s | ESTADO=%s | OBSERVACION=%s", mostrados, dni, estado, observacion)
         if mostrados >= limite:
             break
 
     if mostrados == 0:
         logger.warning("No se encontraron filas con datos en las columnas clave")
+
+
+def _resolver_columnas_por_esquema(fieldnames: list, esquema: list[tuple[str, list[str]]]) -> dict:
+    """Resuelve columnas esperadas por esquema usando coincidencia flexible."""
+    resultados = {}
+    for nombre_logico, candidatos in esquema:
+        resultados[nombre_logico] = _resolver_columna(fieldnames, candidatos)
+    return resultados
+
+
+def imprimir_muestra_google_sheet_desde_url(
+    logger: logging.Logger,
+    sheet_url: str,
+    etiqueta: str,
+    max_rows: int = 5,
+    esquema_columnas: list[tuple[str, list[str]]] | None = None,
+) -> None:
+    """Imprime una muestra de una hoja remota específica."""
+    csv_url = _build_google_sheet_csv_url(sheet_url)
+
+    req = Request(
+        csv_url,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; carnet-emision-bot/1.0)"},
+    )
+    with urlopen(req, timeout=25) as resp:
+        content = resp.read()
+
+    text = content.decode("utf-8-sig", errors="replace")
+    reader = csv.DictReader(io.StringIO(text))
+    rows = list(reader)
+    if not rows:
+        logger.warning("[%s] Google Sheet accesible, pero no devolvió filas", etiqueta)
+        return
+
+    esquema_default = esquema_columnas or [
+        ("dni", ["dni"]),
+        ("estado", ["estado"]),
+        ("observacion", ["observacion", "observaciones", "observ", "obs"]),
+    ]
+    columnas = _resolver_columnas_por_esquema(reader.fieldnames or [], esquema_default)
+
+    faltantes = [nombre.upper() for nombre, valor in columnas.items() if not valor]
+    if faltantes:
+        raise Exception(f"[{etiqueta}] No se encontraron columnas esperadas en Google Sheet: {faltantes}")
+
+    total = len(rows)
+    limite = max(1, int(max_rows or 5))
+    logger.info("[%s] Google Sheet accesible: %s", etiqueta, csv_url)
+    logger.info("[%s] Filas totales detectadas: %s", etiqueta, total)
+    logger.info("[%s] Mostrando %s registros de muestra", etiqueta, min(limite, total))
+
+    mostrados = 0
+    for row in rows:
+        valores = {nombre: str(row.get(columna, "") or "").strip() for nombre, columna in columnas.items()}
+        if not any(valores.values()):
+            continue
+        mostrados += 1
+        partes = " | ".join(f"{nombre.upper()}={valor}" for nombre, valor in valores.items())
+        logger.info("[%s] Muestra %s | %s", etiqueta, mostrados, partes)
+        if mostrados >= limite:
+            break
+
+    if mostrados == 0:
+        logger.warning("[%s] No se encontraron filas con datos en las columnas clave", etiqueta)
+
+
+def _leer_google_sheet_rows(sheet_url: str, logger: logging.Logger) -> tuple[list, list]:
+    """Lee una hoja de Google Sheets por CSV y devuelve (rows, fieldnames)."""
+    csv_url = _build_google_sheet_csv_url(sheet_url)
+    req = Request(
+        csv_url,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; carnet-emision-bot/1.0)"},
+    )
+    with urlopen(req, timeout=25) as resp:
+        content = resp.read()
+
+    text = content.decode("utf-8-sig", errors="replace")
+    reader = csv.DictReader(io.StringIO(text))
+    rows = list(reader)
+    return rows, list(reader.fieldnames or [])
+
+
+def _resolver_columna(fieldnames: list, candidatos: list[str]) -> str | None:
+    normalizados = {str(col or "").strip().lower(): col for col in fieldnames}
+    for candidato in candidatos:
+        candidato_norm = str(candidato or "").strip().lower()
+        if candidato_norm in normalizados:
+            return normalizados[candidato_norm]
+    return None
+
+
+def comparar_dnis_entre_hojas(logger: logging.Logger, max_rows: int = 5) -> None:
+    """Cruza dos hojas de Google Sheets por DNI y muestra coincidencias / diferencias."""
+    url_base = str(os.getenv("CARNET_GSHEET_URL", DEFAULT_GSHEET_URL) or DEFAULT_GSHEET_URL).strip()
+    url_compare = str(os.getenv("CARNET_GSHEET_COMPARE_URL", DEFAULT_GSHEET_COMPARE_URL) or "").strip()
+
+    if not url_compare:
+        raise Exception("Falta CARNET_GSHEET_COMPARE_URL para poder hacer el cruce por DNI")
+
+    rows_base, fields_base = _leer_google_sheet_rows(url_base, logger)
+    rows_compare, fields_compare = _leer_google_sheet_rows(url_compare, logger)
+
+    col_base_dni = _resolver_columna(fields_base, ["dni"])
+    col_cmp_dni = _resolver_columna(fields_compare, ["dni"])
+    col_cmp_compania = _resolver_columna(fields_compare, ["compania", "compañia", "empresa"])
+    col_base_estado = _resolver_columna(fields_base, ["estado"])
+    col_cmp_estado = _resolver_columna(fields_compare, ["estado"])
+    col_base_obs = _resolver_columna(fields_base, ["observacion", "observaciones", "observ", "obs"])
+    col_cmp_obs = _resolver_columna(fields_compare, ["observacion", "observaciones", "observ", "obs"])
+    col_cmp_responsable = _resolver_columna(fields_compare, ["responsable"])
+    col_cmp_fecha = _resolver_columna(fields_compare, ["fecha tramite", "fecha tram ite", "fechatramite", "fecha_tramite", "fecha trámite"])
+
+    faltantes = []
+    if not col_base_dni:
+        faltantes.append("DNI hoja base")
+    if not col_cmp_dni:
+        faltantes.append("DNI hoja comparación")
+    if not col_cmp_compania:
+        faltantes.append("COMPANIA hoja comparación")
+    if faltantes:
+        raise Exception(f"No se pudo detectar la columna DNI: {faltantes}")
+
+    base_por_dni = {}
+    for row in rows_base:
+        dni = str(row.get(col_base_dni, "") or "").strip()
+        if dni and dni not in base_por_dni:
+            base_por_dni[dni] = row
+
+    compare_por_dni = {}
+    for row in rows_compare:
+        dni = str(row.get(col_cmp_dni, "") or "").strip()
+        if dni and dni not in compare_por_dni:
+            compare_por_dni[dni] = row
+
+    comun = sorted(set(base_por_dni).intersection(compare_por_dni))
+    solo_base = sorted(set(base_por_dni).difference(compare_por_dni))
+    solo_compare = sorted(set(compare_por_dni).difference(base_por_dni))
+
+    logger.info("Cruce por DNI activado")
+    logger.info("Base: %s filas | Comparación: %s filas", len(rows_base), len(rows_compare))
+    logger.info("Coinciden en ambas hojas: %s", len(comun))
+    logger.info("Solo en base: %s | Solo en comparación: %s", len(solo_base), len(solo_compare))
+
+    limite = max(1, int(max_rows or 5))
+    for idx, dni in enumerate(comun[:limite], start=1):
+        base_row = base_por_dni[dni]
+        cmp_row = compare_por_dni[dni]
+        base_estado = str(base_row.get(col_base_estado, "") or "").strip() if col_base_estado else ""
+        cmp_compania = str(cmp_row.get(col_cmp_compania, "") or "").strip() if col_cmp_compania else ""
+        cmp_responsable = str(cmp_row.get(col_cmp_responsable, "") or "").strip() if col_cmp_responsable else ""
+        cmp_estado = str(cmp_row.get(col_cmp_estado, "") or "").strip() if col_cmp_estado else ""
+        base_obs = str(base_row.get(col_base_obs, "") or "").strip() if col_base_obs else ""
+        cmp_obs = str(cmp_row.get(col_cmp_obs, "") or "").strip() if col_cmp_obs else ""
+        cmp_fecha = str(cmp_row.get(col_cmp_fecha, "") or "").strip() if col_cmp_fecha else ""
+        logger.info(
+            "Cruce %s | DNI=%s | BASE[ESTADO=%s | OBS=%s] | COMP[COMPANIA=%s | RESPONSABLE=%s | ESTADO=%s | OBS=%s | FECHA_TRAMITE=%s]",
+            idx,
+            dni,
+            base_estado,
+            base_obs,
+            cmp_compania,
+            cmp_responsable,
+            cmp_estado,
+            cmp_obs,
+            cmp_fecha,
+        )
+
+    if not comun:
+        logger.warning("No se encontraron DNIs en común entre ambas hojas")
 
 
 def esperar_ajax_primefaces(page, timeout_ms: int = 7000) -> None:
@@ -842,12 +1019,39 @@ def ejecutar_flujo_secundario() -> int:
 
     if _as_bool_env("CARNET_SHEET_PRINT_SAMPLE", default=True):
         try:
-            imprimir_muestra_google_sheet(
+            max_rows = max(1, _safe_int_env("CARNET_SHEET_SAMPLE_ROWS", 5))
+            url_base = str(os.getenv("CARNET_GSHEET_URL", DEFAULT_GSHEET_URL) or DEFAULT_GSHEET_URL).strip()
+            esquema_base = [
+                ("dni", ["dni"]),
+                ("departamento", ["indicar el departamento donde labora o donde postuló", "indicar el departamento donde labora o donde postulo", "departamento"]),
+                ("puesto", ["puesto"]),
+            ]
+            imprimir_muestra_google_sheet_desde_url(logger, url_base, "HOJA_BASE", max_rows=max_rows, esquema_columnas=esquema_base)
+
+            url_compare = str(os.getenv("CARNET_GSHEET_COMPARE_URL", DEFAULT_GSHEET_COMPARE_URL) or "").strip()
+            if url_compare:
+                esquema_compare = [
+                    ("compania", ["compania", "compañia", "empresa"]),
+                    ("dni", ["dni"]),
+                    ("responsable", ["responsable"]),
+                    ("estado", ["estado"]),
+                    ("observacion", ["observacion", "observaciones", "observ", "obs"]),
+                    ("fecha_tramite", ["fecha tramite", "fecha_tramite", "fechatramite", "fecha trámite"]),
+                ]
+                imprimir_muestra_google_sheet_desde_url(logger, url_compare, "HOJA_COMPARACION", max_rows=max_rows, esquema_columnas=esquema_compare)
+        except Exception as exc:
+            logger.warning("No se pudo leer Google Sheet de muestra: %s", exc)
+
+    if _as_bool_env("CARNET_SHEET_CROSSCHECK_ONLY", default=False):
+        try:
+            comparar_dnis_entre_hojas(
                 logger,
                 max_rows=max(1, _safe_int_env("CARNET_SHEET_SAMPLE_ROWS", 5)),
             )
         except Exception as exc:
-            logger.warning("No se pudo leer Google Sheet de muestra: %s", exc)
+            logger.warning("No se pudo completar el cruce de hojas: %s", exc)
+        logger.info("CARNET_SHEET_CROSSCHECK_ONLY=1 -> finaliza tras el cruce de hojas")
+        return 0
 
     if _as_bool_env("CARNET_SHEET_DEMO_ONLY", default=False):
         logger.info("CARNET_SHEET_DEMO_ONLY=1 -> finaliza tras imprimir muestra del Google Sheet")
