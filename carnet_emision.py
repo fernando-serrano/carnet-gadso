@@ -4,10 +4,14 @@ import re
 import subprocess
 import sys
 import time
+import csv
+import io
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 import logging
+from urllib.parse import parse_qs, urlparse
+from urllib.request import Request, urlopen
 
 from dotenv import load_dotenv
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -26,6 +30,11 @@ URL_LOGIN = os.getenv(
     "CARNET_URL_LOGIN",
     "https://www.sucamec.gob.pe/sel/faces/login.xhtml?faces-redirect=true",
 ).strip()
+
+DEFAULT_GSHEET_URL = (
+    "https://docs.google.com/spreadsheets/d/1I5CmLAxZxA5gIlHz_m5kDPTaHIs1yOEWvy7tN4Ia2hs/"
+    "edit?pli=1&gid=999619533#gid=999619533"
+)
 
 CREDENCIALES_JV = {
     "tipo_documento_valor": os.getenv("CARNET_TIPO_DOC", os.getenv("TIPO_DOC", "RUC")).strip(),
@@ -252,9 +261,16 @@ def activar_pestana_autenticacion_tradicional(page) -> None:
     )
 
 
-def validar_resultado_login_por_ui(page, timeout_ms: int = 6000):
+def validar_resultado_login_por_ui(page, timeout_ms: int = 12000):
     inicio = time.time()
     while (time.time() - inicio) * 1000 < timeout_ms:
+        try:
+            url_actual = (page.url or "").lower()
+            if "/faces/aplicacion/inicio.xhtml" in url_actual:
+                return True, None, time.time() - inicio
+        except Exception:
+            pass
+
         for sel in SUCCESS_SELECTORS:
             try:
                 if page.locator(sel).first.is_visible(timeout=120):
@@ -473,6 +489,99 @@ def validar_credenciales_configuradas(credenciales: dict, etiqueta: str):
         )
 
 
+def _normalizar_columna(nombre: str) -> str:
+    return str(nombre or "").strip().lower()
+
+
+def _build_google_sheet_csv_url(sheet_url: str) -> str:
+    raw = str(sheet_url or "").strip()
+    if not raw:
+        raise Exception("URL de Google Sheets vacía")
+
+    parsed = urlparse(raw)
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", parsed.path or "")
+    if not m:
+        raise Exception("No se pudo extraer el ID del Google Sheet desde la URL")
+    sheet_id = m.group(1)
+
+    gid = None
+    q = parse_qs(parsed.query or "")
+    if q.get("gid"):
+        gid = q.get("gid")[0]
+    if not gid and parsed.fragment:
+        frag = parse_qs(parsed.fragment)
+        if frag.get("gid"):
+            gid = frag.get("gid")[0]
+        elif "gid=" in parsed.fragment:
+            gid = parsed.fragment.split("gid=", 1)[1].split("&", 1)[0]
+    gid = str(gid or "0").strip() or "0"
+
+    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+
+
+def imprimir_muestra_google_sheet(logger: logging.Logger, max_rows: int = 5) -> None:
+    """Lee una hoja de Google Sheets vía CSV y muestra una muestra de registros."""
+    gsheet_url = str(os.getenv("CARNET_GSHEET_URL", DEFAULT_GSHEET_URL) or DEFAULT_GSHEET_URL).strip()
+    csv_url = _build_google_sheet_csv_url(gsheet_url)
+
+    req = Request(
+        csv_url,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; carnet-emision-bot/1.0)"},
+    )
+    with urlopen(req, timeout=25) as resp:
+        content = resp.read()
+
+    text = content.decode("utf-8-sig", errors="replace")
+    reader = csv.DictReader(io.StringIO(text))
+    rows = list(reader)
+    if not rows:
+        logger.warning("Google Sheet accesible, pero no devolvió filas")
+        return
+
+    col_dni = None
+    col_departamento = None
+    col_puesto = None
+    for col in (reader.fieldnames or []):
+        ncol = _normalizar_columna(col)
+        if col_dni is None and ncol == "dni":
+            col_dni = col
+        if col_departamento is None and "indicar el departamento donde labora" in ncol:
+            col_departamento = col
+        if col_puesto is None and ncol == "puesto":
+            col_puesto = col
+
+    faltantes = []
+    if not col_dni:
+        faltantes.append("DNI")
+    if not col_departamento:
+        faltantes.append("Indicar el departamento donde Labora o donde postuló")
+    if not col_puesto:
+        faltantes.append("PUESTO")
+    if faltantes:
+        raise Exception(f"No se encontraron columnas esperadas en Google Sheet: {faltantes}")
+
+    total = len(rows)
+    limite = max(1, int(max_rows or 5))
+    logger.info("Google Sheet accesible: %s", csv_url)
+    logger.info("Filas totales detectadas: %s", total)
+    logger.info("Mostrando %s registros de muestra", min(limite, total))
+
+    mostrados = 0
+    for row in rows:
+        dni = str(row.get(col_dni, "") or "").strip()
+        dep = str(row.get(col_departamento, "") or "").strip()
+        puesto = str(row.get(col_puesto, "") or "").strip()
+        if not dni and not dep and not puesto:
+            continue
+        mostrados += 1
+        logger.info("Muestra %s | DNI=%s | Departamento=%s | Puesto=%s", mostrados, dni, dep, puesto)
+        if mostrados >= limite:
+            break
+
+    if mostrados == 0:
+        logger.warning("No se encontraron filas con datos en las columnas clave")
+
+
 def esperar_ajax_primefaces(page, timeout_ms: int = 7000) -> None:
     """Espera a que la cola AJAX de PrimeFaces quede vacía (si existe)."""
     try:
@@ -663,7 +772,7 @@ def ejecutar_login_grupo(playwright, logger: logging.Logger, grupo: str):
 
     hold_browser_open = _as_bool_env("HOLD_BROWSER_OPEN", default=False)
     headless = _as_bool_env("CARNET_HEADLESS", default=False)
-    login_validation_timeout_ms = max(1000, _safe_int_env("LOGIN_VALIDATION_TIMEOUT_MS", 6000))
+    login_validation_timeout_ms = max(1000, _safe_int_env("LOGIN_VALIDATION_TIMEOUT_MS", 12000))
 
     browser = None
     context = None
@@ -730,6 +839,19 @@ def ejecutar_flujo_secundario() -> int:
     child_suffix = f"worker_{worker_id}" if _as_bool_env("MULTIWORKER_CHILD", default=False) else "main"
     logger = setup_logger("carnet_emision", suffix=child_suffix)
     logger.info("INICIANDO FLUJO CARNET - Login automático")
+
+    if _as_bool_env("CARNET_SHEET_PRINT_SAMPLE", default=True):
+        try:
+            imprimir_muestra_google_sheet(
+                logger,
+                max_rows=max(1, _safe_int_env("CARNET_SHEET_SAMPLE_ROWS", 5)),
+            )
+        except Exception as exc:
+            logger.warning("No se pudo leer Google Sheet de muestra: %s", exc)
+
+    if _as_bool_env("CARNET_SHEET_DEMO_ONLY", default=False):
+        logger.info("CARNET_SHEET_DEMO_ONLY=1 -> finaliza tras imprimir muestra del Google Sheet")
+        return 0
 
     grupos = resolver_grupos_objetivo()
     group_override = str(os.getenv("WORKER_GROUP", "") or "").strip().upper()
