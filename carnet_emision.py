@@ -78,6 +78,9 @@ SEL = {
     "crear_solicitud_sede_trigger": '#createForm\\:dondeRecoger .ui-selectonemenu-trigger',
     "crear_solicitud_sede_label": '#createForm\\:dondeRecoger_label',
     "crear_solicitud_sede_panel": '#createForm\\:dondeRecoger_panel',
+    "crear_solicitud_modalidad_trigger": '#createForm\\:modalidad .ui-selectonemenu-trigger',
+    "crear_solicitud_modalidad_label": '#createForm\\:modalidad_label',
+    "crear_solicitud_modalidad_panel": '#createForm\\:modalidad_panel',
 }
 
 SUCCESS_SELECTORS = [
@@ -922,6 +925,7 @@ def _cargar_cruce_pendiente_desde_hojas(logger: logging.Logger, max_rows: int = 
             "departamento",
         ],
     )
+    col_base_puesto = _resolver_columna(fields_base, ["puesto"])
     col_cmp_dni = _resolver_columna(fields_compare, ["dni"])
     col_cmp_estado = _resolver_columna(fields_compare, ["estado_tramite"])
     col_cmp_obs = _resolver_columna(fields_compare, ["observacion"])
@@ -977,16 +981,20 @@ def _cargar_cruce_pendiente_desde_hojas(logger: logging.Logger, max_rows: int = 
         base_row = base_match.get("row") if base_match else None
         base_row_number = int(base_match.get("row_number", 0) or 0) if base_match else 0
         departamento = str(base_row.get(col_base_departamento, "") or "").strip() if base_row else ""
+        puesto = str(base_row.get(col_base_puesto, "") or "").strip() if (base_row and col_base_puesto) else ""
         sede, origen_sede = resolver_sede_atencion_desde_departamento(departamento)
+        modalidad_objetivo, modalidad_origen = resolver_modalidad_desde_puesto(puesto)
 
         if base_row:
             logger.info(
-                "[CRUCE][OK] COMP_FILA=%s | DNI=%s | BASE_FILA=%s | BASE_TOTAL=%s | DEPARTAMENTO=%s",
+                "[CRUCE][OK] COMP_FILA=%s | DNI=%s | BASE_FILA=%s | BASE_TOTAL=%s | DEPARTAMENTO=%s | PUESTO=%s | MODALIDAD_OBJETIVO=%s",
                 idx,
                 dni,
                 base_row_number,
                 len(rows_base),
                 departamento,
+                puesto,
+                modalidad_objetivo,
             )
         else:
             logger.warning(
@@ -1004,8 +1012,11 @@ def _cargar_cruce_pendiente_desde_hojas(logger: logging.Logger, max_rows: int = 
                 "base_row": base_row,
                 "base_row_number": base_row_number,
                 "departamento": departamento,
+                "puesto": puesto,
                 "sede": sede,
                 "origen_sede": origen_sede,
+                "modalidad_objetivo": modalidad_objetivo,
+                "modalidad_origen": modalidad_origen,
                 "fieldnames_compare": fields_compare,
                 "col_cmp_obs": col_cmp_obs,
                 "col_cmp_fecha": col_cmp_fecha,
@@ -1155,6 +1166,43 @@ def _obtener_opciones_sede_atencion(page) -> list[str]:
     return salida
 
 
+def _obtener_opciones_modalidad(page) -> list[str]:
+    """Abre el combo y obtiene las opciones visibles del desplegable Modalidad."""
+    trigger = page.locator(SEL["crear_solicitud_modalidad_trigger"])
+    panel = page.locator(SEL["crear_solicitud_modalidad_panel"])
+
+    trigger.wait_for(state="visible", timeout=12000)
+    trigger.click()
+    panel.wait_for(state="visible", timeout=7000)
+
+    items = panel.locator("li.ui-selectonemenu-item")
+    total = items.count()
+    opciones = []
+    for idx in range(total):
+        item = items.nth(idx)
+        texto = str(item.get_attribute("data-label") or item.inner_text() or "").strip()
+        if texto:
+            opciones.append(texto)
+
+    try:
+        trigger.click(timeout=2000)
+    except Exception:
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+
+    vistos = set()
+    salida = []
+    for op in opciones:
+        op_norm = _normalizar_columna(op)
+        if op_norm in vistos:
+            continue
+        vistos.add(op_norm)
+        salida.append(op)
+    return salida
+
+
 def resolver_sede_para_dropdown(page, departamento: str, sede_sugerida: str) -> tuple[str, str]:
     """Resuelve la mejor sede para el dropdown: exacta si existe; si no, la geográficamente más cercana."""
     opciones = _obtener_opciones_sede_atencion(page)
@@ -1193,6 +1241,40 @@ def resolver_sede_para_dropdown(page, departamento: str, sede_sugerida: str) -> 
 
     # Fallback final: si no hay coordenadas suficientes, usar primera opción disponible.
     return mejor_op, "dropdown:fallback_primera"
+
+
+def resolver_modalidad_desde_puesto(puesto: str) -> tuple[str, str]:
+    """Resuelve modalidad objetivo en base al campo PUESTO de la hoja base."""
+    puesto_norm = _normalizar_columna(puesto)
+    if "proteccion privada" in puesto_norm:
+        return "PROTECCION PRIVADA", "puesto:proteccion_privada"
+    return "VIGILANCIA PRIVADA", "puesto:default_vigilancia"
+
+
+def resolver_modalidad_para_dropdown(page, modalidad_objetivo: str) -> tuple[str, str]:
+    """Ajusta modalidad objetivo a una opción real del dropdown (exacta o alias)."""
+    opciones = _obtener_opciones_modalidad(page)
+    if not opciones:
+        return modalidad_objetivo, "modalidad:sin_opciones_dropdown"
+
+    objetivo_norm = _normalizar_columna(modalidad_objetivo)
+    for op in opciones:
+        op_norm = _normalizar_columna(op)
+        if objetivo_norm == op_norm or objetivo_norm in op_norm or op_norm in objetivo_norm:
+            return op, "modalidad:dropdown:exacta"
+
+    if objetivo_norm == "proteccion privada":
+        for op in opciones:
+            op_norm = _normalizar_columna(op)
+            if "proteccion" in op_norm and ("privada" in op_norm or "personal" in op_norm):
+                return op, "modalidad:dropdown:alias_proteccion"
+
+    for op in opciones:
+        op_norm = _normalizar_columna(op)
+        if "vigilancia privada" in op_norm:
+            return op, "modalidad:dropdown:fallback_vigilancia"
+
+    return opciones[0], "modalidad:dropdown:fallback_primera"
 
 
 def resolver_sede_atencion_desde_departamento(departamento: str) -> tuple[str, str]:
@@ -1276,6 +1358,17 @@ def seleccionar_sede_atencion(page, sede: str) -> None:
     )
 
 
+def seleccionar_modalidad(page, modalidad: str) -> None:
+    seleccionar_opcion_primefaces(
+        page,
+        trigger_selector=SEL["crear_solicitud_modalidad_trigger"],
+        panel_selector=SEL["crear_solicitud_modalidad_panel"],
+        label_selector=SEL["crear_solicitud_modalidad_label"],
+        valor=modalidad,
+        nombre_campo="Modalidad",
+    )
+
+
 def procesar_registro_cruce_en_formulario(page, logger: logging.Logger, item: dict) -> bool:
     """Aplica la sede de atención y actualiza la fila de comparación para un registro individual."""
     compare_url = str(item.get("compare_url", "") or "").strip()
@@ -1320,6 +1413,24 @@ def procesar_registro_cruce_en_formulario(page, logger: logging.Logger, item: di
     )
     seleccionar_sede_atencion(page, sede)
     logger.info("[FORM] Sede de atención aplicada en la vista: %s", sede)
+
+    modalidad_objetivo = str(item.get("modalidad_objetivo", "") or "").strip() or "VIGILANCIA PRIVADA"
+    modalidad_aplicada = modalidad_objetivo
+    modalidad_dropdown_origen = "modalidad:no_verificado_dropdown"
+    if page is not None:
+        modalidad_aplicada, modalidad_dropdown_origen = resolver_modalidad_para_dropdown(page, modalidad_objetivo)
+
+    logger.info(
+        "[FORM] DNI=%s | PUESTO=%s | MODALIDAD_OBJETIVO=%s | MODALIDAD_APLICADA=%s | MODALIDAD_ORIGEN=%s | MODALIDAD_ORIGEN_DROPDOWN=%s",
+        dni,
+        item.get("puesto", ""),
+        modalidad_objetivo,
+        modalidad_aplicada,
+        item.get("modalidad_origen", ""),
+        modalidad_dropdown_origen,
+    )
+    seleccionar_modalidad(page, modalidad_aplicada)
+    logger.info("[FORM] Modalidad aplicada en la vista: %s", modalidad_aplicada)
 
     if compare_url and compare_row_number > 0:
         _actualizar_fila_comparacion_por_row(
@@ -1940,12 +2051,14 @@ def _ejecutar_flujo_fila_por_fila(logger: logging.Logger, max_rows: int = 1) -> 
                 grupo = "JV"
 
             logger.info(
-                "[FILA %s] DNI=%s | GRUPO=%s | DEPARTAMENTO=%s | SEDE=%s | ORIGEN=%s | CRUCE_BASE_FILA=%s",
+                "[FILA %s] DNI=%s | GRUPO=%s | DEPARTAMENTO=%s | PUESTO=%s | SEDE=%s | MODALIDAD_OBJETIVO=%s | ORIGEN=%s | CRUCE_BASE_FILA=%s",
                 idx,
                 item.get("dni", ""),
                 grupo,
                 item.get("departamento", ""),
+                item.get("puesto", ""),
                 item.get("sede", ""),
+                item.get("modalidad_objetivo", ""),
                 item.get("origen_sede", ""),
                 item.get("base_row_number", 0),
             )
