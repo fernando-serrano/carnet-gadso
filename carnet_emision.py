@@ -7,6 +7,7 @@ import time
 import csv
 import io
 import mimetypes
+import math
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -43,7 +44,7 @@ DEFAULT_GSHEET_COMPARE_URL = ""
 DEFAULT_GSHEET_THIRD_URL = ""
 DEFAULT_DRIVE_ROOT_FOLDER_ID = ""
 DEFAULT_DRIVE_CREDENTIALS_JSON = ""
-DEFAULT_DRIVE_VALIDATE_ON_START = "1"
+DEFAULT_DRIVE_VALIDATE_ON_START = "0"
 
 CREDENCIALES_JV = {
     "tipo_documento_valor": os.getenv("CARNET_TIPO_DOC", os.getenv("TIPO_DOC", "RUC")).strip(),
@@ -74,6 +75,9 @@ SEL = {
     "menu_item_carne": '.ui-menuitem-link:has(span.ui-menuitem-text:text-is("CARNÉ")), .ui-menuitem-link:has(span.ui-menuitem-text:text-is("CARNE")), .ui-menuitem-link:has(span.ui-menuitem-text:has-text("CARN"))',
     "menu_item_crear_solicitud": '.ui-menuitem-link:has(span.ui-menuitem-text:text-is("CREAR SOLICITUD")), .ui-menuitem-link:has(span.ui-menuitem-text:has-text("CREAR SOLICITUD"))',
     "menu_item_crear_solicitud_onclick": 'a[onclick*="addSubmitParam"][onclick*="j_idt11:menuprincipal"]:has(span.ui-menuitem-text:text-is("CREAR SOLICITUD")), a[onclick*="addSubmitParam"][onclick*="j_idt11:menuPrincipal"]:has(span.ui-menuitem-text:text-is("CREAR SOLICITUD"))',
+    "crear_solicitud_sede_trigger": '#createForm\\:dondeRecoger .ui-selectonemenu-trigger',
+    "crear_solicitud_sede_label": '#createForm\\:dondeRecoger_label',
+    "crear_solicitud_sede_panel": '#createForm\\:dondeRecoger_panel',
 }
 
 SUCCESS_SELECTORS = [
@@ -90,6 +94,110 @@ ERROR_SELECTORS = [
     "[class*='error']",
     "[class*='Error']",
 ]
+
+
+SEDES_SUCAMEC_DISPONIBLES = [
+    "LA LIBERTAD",
+    "CAJAMARCA",
+    "CHICLAYO",
+    "ANCASH",
+    "AREQUIPA",
+    "TACNA",
+    "CUSCO",
+    "LIMA",
+    "JUNIN",
+    "PIURA",
+    "ICA",
+    "PUNO",
+    "LORETO",
+]
+
+DEPARTAMENTO_A_SEDE = {
+    "LIMA": "LIMA",
+    "CALLAO": "LIMA",
+    "ICA": "ICA",
+    "PIURA": "PIURA",
+    "TUMBES": "PIURA",
+    "LA LIBERTAD": "LA LIBERTAD",
+    "LALIBERTAD": "LA LIBERTAD",
+    "TRUJILLO": "LA LIBERTAD",
+    "CAJAMARCA": "CAJAMARCA",
+    "CHICLAYO": "CHICLAYO",
+    "LAMBAYEQUE": "CHICLAYO",
+    "ANCASH": "ANCASH",
+    "AREQUIPA": "AREQUIPA",
+    "MOQUEGUA": "TACNA",
+    "TACNA": "TACNA",
+    "CUSCO": "CUSCO",
+    "MADRE DE DIOS": "CUSCO",
+    "JUNIN": "JUNIN",
+    "HUANCAVELICA": "JUNIN",
+    "PASCO": "JUNIN",
+    "AYACUCHO": "JUNIN",
+    "PUNO": "PUNO",
+    "LORETO": "LORETO",
+    "AMAZONAS": "LORETO",
+    "SAN MARTIN": "LORETO",
+    "UCAYALI": "LORETO",
+}
+
+DEPARTAMENTO_FALLBACK_POR_REGION = {
+    "AYACUCHO": "JUNIN",
+    "APURIMAC": "CUSCO",
+    "HUANCAVELICA": "JUNIN",
+    "HUANUCO": "JUNIN",
+    "AMAZONAS": "CAJAMARCA",
+    "SAN MARTIN": "LORETO",
+    "UCAYALI": "LORETO",
+    "MADRE DE DIOS": "CUSCO",
+    "PASCO": "JUNIN",
+}
+
+SEDE_COORDS = {
+    "LIMA": (-12.0464, -77.0428),
+    "LA LIBERTAD": (-8.1118, -79.0287),
+    "CAJAMARCA": (-7.1617, -78.5128),
+    "CHICLAYO": (-6.7714, -79.8409),
+    "ANCASH": (-9.5278, -77.5278),
+    "AREQUIPA": (-16.4090, -71.5375),
+    "TACNA": (-18.0146, -70.2536),
+    "CUSCO": (-13.5319, -71.9675),
+    "JUNIN": (-12.0651, -75.2049),
+    "PIURA": (-5.1945, -80.6328),
+    "ICA": (-14.0678, -75.7286),
+    "PUNO": (-15.8402, -70.0219),
+    "LORETO": (-3.7437, -73.2516),
+}
+
+DEPARTAMENTO_COORDS = {
+    "AMAZONAS": (-6.2317, -77.8690),
+    "ANCASH": (-9.5278, -77.5278),
+    "APURIMAC": (-13.6339, -72.8814),
+    "AREQUIPA": (-16.4090, -71.5375),
+    "AYACUCHO": (-13.1631, -74.2236),
+    "CAJAMARCA": (-7.1617, -78.5128),
+    "CALLAO": (-12.0566, -77.1181),
+    "CHICLAYO": (-6.7714, -79.8409),
+    "CUSCO": (-13.5319, -71.9675),
+    "HUANCAVELICA": (-12.7864, -74.9767),
+    "HUANUCO": (-9.9306, -76.2422),
+    "ICA": (-14.0678, -75.7286),
+    "JUNIN": (-12.0651, -75.2049),
+    "LA LIBERTAD": (-8.1118, -79.0287),
+    "LAMBAYEQUE": (-6.7011, -79.9061),
+    "LIMA": (-12.0464, -77.0428),
+    "LORETO": (-3.7437, -73.2516),
+    "MADRE DE DIOS": (-12.5942, -69.1891),
+    "MOQUEGUA": (-17.1925, -70.9328),
+    "PASCO": (-10.6864, -76.2627),
+    "PIURA": (-5.1945, -80.6328),
+    "PUNO": (-15.8402, -70.0219),
+    "SAN MARTIN": (-6.4859, -76.3732),
+    "TACNA": (-18.0146, -70.2536),
+    "TRUJILLO": (-8.1118, -79.0287),
+    "TUMBES": (-3.5669, -80.4515),
+    "UCAYALI": (-8.3791, -74.5539),
+}
 
 
 OCR_AVAILABLE = False
@@ -530,7 +638,9 @@ def _build_google_sheet_csv_url(sheet_url: str) -> str:
             gid = parsed.fragment.split("gid=", 1)[1].split("&", 1)[0]
     gid = str(gid or "0").strip() or "0"
 
-    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+    # Agregar timestamp para prevenir caché de Google Sheets
+    ts = int(time.time() * 1000)
+    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}&t={ts}"
 
 
 def imprimir_muestra_google_sheet(logger: logging.Logger, max_rows: int = 5) -> None:
@@ -676,13 +786,597 @@ def _leer_google_sheet_rows(sheet_url: str, logger: logging.Logger) -> tuple[lis
     return rows, list(reader.fieldnames or [])
 
 
+def _extract_sheet_id_from_url(sheet_url: str) -> str:
+    raw = str(sheet_url or "").strip()
+    if not raw:
+        raise Exception("URL de Google Sheet vacía")
+    parsed = urlparse(raw)
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", parsed.path or "")
+    if not m:
+        raise Exception("No se pudo extraer el ID del Google Sheet desde la URL")
+    return m.group(1)
+
+
+def _extract_gid_from_url(sheet_url: str) -> str:
+    parsed = urlparse(str(sheet_url or "").strip())
+    gid = None
+    q = parse_qs(parsed.query or "")
+    if q.get("gid"):
+        gid = q.get("gid")[0]
+    if not gid and parsed.fragment:
+        frag = parse_qs(parsed.fragment)
+        if frag.get("gid"):
+            gid = frag.get("gid")[0]
+        elif "gid=" in parsed.fragment:
+            gid = parsed.fragment.split("gid=", 1)[1].split("&", 1)[0]
+    return str(gid or "0").strip() or "0"
+
+
+def _google_sheets_service():
+    try:
+        service_account = importlib.import_module("google.oauth2.service_account")
+        google_build = importlib.import_module("googleapiclient.discovery").build
+    except Exception as exc:
+        raise Exception("Faltan dependencias de Google Sheets API. Instala google-api-python-client y google-auth") from exc
+
+    credentials_path = str(os.getenv("DRIVE_CREDENTIALS_JSON", DEFAULT_DRIVE_CREDENTIALS_JSON) or "").strip()
+    if not credentials_path:
+        raise Exception("Falta DRIVE_CREDENTIALS_JSON en .env")
+
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = service_account.Credentials.from_service_account_file(credentials_path, scopes=scopes)
+    return google_build("sheets", "v4", credentials=creds, cache_discovery=False)
+
+
+def _sheet_col_to_a1(index_zero_based: int) -> str:
+    index = int(index_zero_based)
+    if index < 0:
+        raise ValueError("index_zero_based no puede ser negativo")
+    letters = ""
+    while True:
+        index, remainder = divmod(index, 26)
+        letters = chr(65 + remainder) + letters
+        if index == 0:
+            break
+        index -= 1
+    return letters
+
+
+def _sheet_title_from_gid(service, spreadsheet_id: str, gid: str) -> str:
+    response = service.spreadsheets().get(
+        spreadsheetId=spreadsheet_id,
+        fields="sheets(properties(sheetId,title))",
+    ).execute()
+    target_gid = int(str(gid or "0").strip() or "0")
+    for sheet in response.get("sheets", []) or []:
+        props = sheet.get("properties", {}) or {}
+        if int(props.get("sheetId", -1)) == target_gid:
+            return str(props.get("title", "")).strip()
+    raise Exception(f"No se encontró pestaña con gid={gid} en el spreadsheet")
+
+
+def _update_sheet_cells_by_row(service, spreadsheet_id: str, sheet_title: str, row_number: int, updates: dict[str, str], fieldnames: list[str]) -> None:
+    data = []
+    for field_name, value in updates.items():
+        column_index = None
+        for idx, candidate in enumerate(fieldnames):
+            if _normalizar_columna(candidate) == _normalizar_columna(field_name):
+                column_index = idx
+                break
+        if column_index is None:
+            continue
+        column_a1 = _sheet_col_to_a1(column_index)
+        data.append(
+            {
+                "range": f"{sheet_title}!{column_a1}{row_number}",
+                "values": [[str(value or "")]],
+            }
+        )
+
+    if not data:
+        return
+
+    service.spreadsheets().values().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={
+            "valueInputOption": "RAW",
+            "data": data,
+        },
+    ).execute()
+
+
+def _actualizar_fila_comparacion_por_row(logger: logging.Logger, compare_url: str, row_number: int, updates: dict[str, str], fieldnames: list[str] | None = None) -> None:
+    service = _google_sheets_service()
+    spreadsheet_id = _extract_sheet_id_from_url(compare_url)
+    gid = _extract_gid_from_url(compare_url)
+    sheet_title = _sheet_title_from_gid(service, spreadsheet_id, gid)
+
+    if fieldnames is None:
+        _, fieldnames = _leer_google_sheet_rows(compare_url, logger)
+
+    _update_sheet_cells_by_row(service, spreadsheet_id, sheet_title, row_number, updates, fieldnames)
+
+
+def _estado_comparacion_es_objetivo(estado: str, estados_objetivo: set[str], permitir_vacio: bool) -> bool:
+    valor = _normalizar_columna(estado)
+    if not valor:
+        return bool(permitir_vacio)
+    return valor in estados_objetivo
+
+
+def _cargar_cruce_pendiente_desde_hojas(logger: logging.Logger, max_rows: int = 1) -> list[dict]:
+    url_base = str(os.getenv("CARNET_GSHEET_URL", DEFAULT_GSHEET_URL) or DEFAULT_GSHEET_URL).strip()
+    url_compare = str(os.getenv("CARNET_GSHEET_COMPARE_URL", DEFAULT_GSHEET_COMPARE_URL) or "").strip()
+    if not url_compare:
+        raise Exception("Falta CARNET_GSHEET_COMPARE_URL para procesar el cruce")
+
+    rows_base, fields_base = _leer_google_sheet_rows(url_base, logger)
+    rows_compare, fields_compare = _leer_google_sheet_rows(url_compare, logger)
+
+    col_base_dni = _resolver_columna(fields_base, ["dni"])
+    col_base_departamento = _resolver_columna(
+        fields_base,
+        [
+            "indicar el departamento donde labora o donde postuló",
+            "indicar el departamento donde labora o donde postulo",
+            "departamento",
+        ],
+    )
+    col_cmp_dni = _resolver_columna(fields_compare, ["dni"])
+    col_cmp_estado = _resolver_columna(fields_compare, ["estado_tramite"])
+    col_cmp_obs = _resolver_columna(fields_compare, ["observacion"])
+    col_cmp_fecha = _resolver_columna(fields_compare, ["fecha tramite"])
+
+    if not col_base_dni or not col_base_departamento:
+        raise Exception("La hoja base no contiene DNI y/o departamento")
+    if not col_cmp_dni:
+        raise Exception("La hoja de comparación no contiene DNI")
+
+    estados_objetivo_env = str(os.getenv("CARNET_COMPARE_ESTADOS_OBJETIVO", "PENDIENTE") or "PENDIENTE")
+    estados_objetivo = {
+        _normalizar_columna(x)
+        for x in estados_objetivo_env.split(",")
+        if _normalizar_columna(x)
+    }
+    if not estados_objetivo:
+        estados_objetivo = {"pendiente"}
+    permitir_estado_vacio = _as_bool_env("CARNET_COMPARE_ALLOW_EMPTY_ESTADO", default=True)
+    logger.info(
+        "[CRUCE] Criterio ESTADO: objetivos=%s | permitir_vacio=%s",
+        sorted(estados_objetivo),
+        permitir_estado_vacio,
+    )
+
+    base_por_dni = {}
+    for base_idx, row in enumerate(rows_base, start=2):
+        dni = str(row.get(col_base_dni, "") or "").strip()
+        if dni and dni not in base_por_dni:
+            base_por_dni[dni] = {
+                "row": row,
+                "row_number": base_idx,
+            }
+
+    pendientes = []
+    registros_saltados_sin_dni = 0
+    registros_saltados_estado_fuera_criterio = 0
+    
+    for idx, row in enumerate(rows_compare, start=2):
+        dni = str(row.get(col_cmp_dni, "") or "").strip()
+        estado = str(row.get(col_cmp_estado, "") or "").strip() if col_cmp_estado else ""
+        
+        if not dni:
+            registros_saltados_sin_dni += 1
+            continue
+        
+        if not _estado_comparacion_es_objetivo(estado, estados_objetivo, permitir_estado_vacio):
+            registros_saltados_estado_fuera_criterio += 1
+            logger.debug("[CRUCE] Fila %s saltada: DNI=%s tiene ESTADO='%s' (fuera de criterio)", idx, dni, estado)
+            continue
+        
+        base_match = base_por_dni.get(dni)
+        base_row = base_match.get("row") if base_match else None
+        base_row_number = int(base_match.get("row_number", 0) or 0) if base_match else 0
+        departamento = str(base_row.get(col_base_departamento, "") or "").strip() if base_row else ""
+        sede, origen_sede = resolver_sede_atencion_desde_departamento(departamento)
+
+        if base_row:
+            logger.info(
+                "[CRUCE][OK] COMP_FILA=%s | DNI=%s | BASE_FILA=%s | BASE_TOTAL=%s | DEPARTAMENTO=%s",
+                idx,
+                dni,
+                base_row_number,
+                len(rows_base),
+                departamento,
+            )
+        else:
+            logger.warning(
+                "[CRUCE][WARN] COMP_FILA=%s | DNI=%s sin cruce en HOJA_BASE (total=%s)",
+                idx,
+                dni,
+                len(rows_base),
+            )
+
+        pendientes.append(
+            {
+                "row_number": idx,
+                "dni": dni,
+                "estado": estado,
+                "base_row": base_row,
+                "base_row_number": base_row_number,
+                "departamento": departamento,
+                "sede": sede,
+                "origen_sede": origen_sede,
+                "fieldnames_compare": fields_compare,
+                "col_cmp_obs": col_cmp_obs,
+                "col_cmp_fecha": col_cmp_fecha,
+            }
+        )
+        if len(pendientes) >= max(1, int(max_rows or 1)):
+            break
+    
+    logger.info(
+        "[CRUCE] Resumen: %s filas procesadas | %s pendientes (criterio ESTADO) | %s saltadas (DNI vacío) | %s saltadas (ESTADO fuera de criterio)",
+        len(rows_compare),
+        len(pendientes),
+        registros_saltados_sin_dni,
+        registros_saltados_estado_fuera_criterio,
+    )
+
+    return pendientes
+
+
+def ejecutar_prueba_cruce_y_sede_en_formulario(page, logger: logging.Logger, max_rows: int = 1) -> None:
+    """Toma un único registro pendiente y aplica la sede de atención en la vista Crear Solicitud."""
+    pendientes = _cargar_cruce_pendiente_desde_hojas(logger, max_rows=max_rows)
+    if not pendientes:
+        logger.warning("[CRUCE] No hay registros pendientes para la prueba")
+        return
+
+    compare_url = str(os.getenv("CARNET_GSHEET_COMPARE_URL", DEFAULT_GSHEET_COMPARE_URL) or "").strip()
+    fecha_hoy = datetime.now().strftime("%d/%m/%Y")
+
+    for idx, item in enumerate(pendientes, start=1):
+        dni = item["dni"]
+        base_row = item.get("base_row")
+        if not base_row:
+            logger.warning("[CRUCE][%s] DNI=%s no existe en la hoja base", idx, dni)
+            _actualizar_fila_comparacion_por_row(
+                logger,
+                compare_url,
+                item["row_number"],
+                {
+                    "observacion": f"DNI {dni} no encontrado en la hoja base",
+                    "fecha tramite": fecha_hoy,
+                },
+                fieldnames=item.get("fieldnames_compare", []),
+            )
+            continue
+
+        sede = item["sede"]
+        logger.info(
+            "[CRUCE][%s] DNI=%s | DEPARTAMENTO=%s | SEDE=%s | ORIGEN=%s",
+            idx,
+            dni,
+            item.get("departamento", ""),
+            sede,
+            item.get("origen_sede", ""),
+        )
+
+        if idx == 1:
+            seleccionar_sede_atencion(page, sede)
+            logger.info("[FORM] Sede de atención aplicada en la vista: %s", sede)
+
+        _actualizar_fila_comparacion_por_row(
+            logger,
+            compare_url,
+            item["row_number"],
+            {
+                "observacion": "",
+                "fecha tramite": fecha_hoy,
+            },
+            fieldnames=item.get("fieldnames_compare", []),
+        )
+
+
 def _resolver_columna(fieldnames: list, candidatos: list[str]) -> str | None:
-    normalizados = {str(col or "").strip().lower(): col for col in fieldnames}
-    for candidato in candidatos:
-        candidato_norm = str(candidato or "").strip().lower()
-        if candidato_norm in normalizados:
-            return normalizados[candidato_norm]
+    normalizados = {str(candidato or "").strip().lower() for candidato in candidatos}
+    for col in fieldnames:
+        col_norm = str(col or "").strip().lower()
+        if col_norm in normalizados:
+            return col
     return None
+
+
+def _normalizar_departamento(nombre: str) -> str:
+    base = _normalizar_columna(nombre)
+    base = base.replace(" ", "")
+    return base
+
+
+def _distancia_km_aprox(coord_a: tuple[float, float], coord_b: tuple[float, float]) -> float:
+    """Distancia Haversine aproximada en km entre dos coordenadas (lat, lon)."""
+    lat1, lon1 = coord_a
+    lat2, lon2 = coord_b
+
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+
+    a = (math.sin(dlat / 2) ** 2) + math.cos(p1) * math.cos(p2) * (math.sin(dlon / 2) ** 2)
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return 6371.0 * c
+
+
+def _sede_canonica_desde_texto(texto_sede: str) -> str:
+    valor = _normalizar_columna(texto_sede)
+    for sede in SEDES_SUCAMEC_DISPONIBLES:
+        sede_norm = _normalizar_columna(sede)
+        if valor == sede_norm or valor in sede_norm or sede_norm in valor:
+            return sede
+    return ""
+
+
+def _obtener_opciones_sede_atencion(page) -> list[str]:
+    """Abre el combo y obtiene las opciones visibles del desplegable Sede de Atención."""
+    trigger = page.locator(SEL["crear_solicitud_sede_trigger"])
+    panel = page.locator(SEL["crear_solicitud_sede_panel"])
+
+    trigger.wait_for(state="visible", timeout=12000)
+    trigger.click()
+    panel.wait_for(state="visible", timeout=7000)
+
+    items = panel.locator("li.ui-selectonemenu-item")
+    total = items.count()
+    opciones = []
+    for idx in range(total):
+        item = items.nth(idx)
+        texto = str(item.get_attribute("data-label") or item.inner_text() or "").strip()
+        if texto:
+            opciones.append(texto)
+
+    # Cerramos el panel para mantener sincronía del formulario.
+    try:
+        trigger.click(timeout=2000)
+    except Exception:
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+
+    vistos = set()
+    salida = []
+    for op in opciones:
+        op_norm = _normalizar_columna(op)
+        if op_norm in vistos:
+            continue
+        vistos.add(op_norm)
+        salida.append(op)
+    return salida
+
+
+def resolver_sede_para_dropdown(page, departamento: str, sede_sugerida: str) -> tuple[str, str]:
+    """Resuelve la mejor sede para el dropdown: exacta si existe; si no, la geográficamente más cercana."""
+    opciones = _obtener_opciones_sede_atencion(page)
+    if not opciones:
+        return sede_sugerida, "sin_opciones_dropdown"
+
+    objetivo_norm = _normalizar_columna(sede_sugerida)
+    for op in opciones:
+        op_norm = _normalizar_columna(op)
+        if objetivo_norm == op_norm or objetivo_norm in op_norm or op_norm in objetivo_norm:
+            return op, "dropdown:exacta"
+
+    dep_norm = _normalizar_columna(departamento).upper()
+    dep_coord = DEPARTAMENTO_COORDS.get(dep_norm)
+    if not dep_coord:
+        dep_canon = _normalizar_departamento(departamento)
+        dep_coord = DEPARTAMENTO_COORDS.get(dep_canon)
+
+    mejor_op = opciones[0]
+    mejor_dist = float("inf")
+    if dep_coord:
+        for op in opciones:
+            sede_canon = _sede_canonica_desde_texto(op)
+            if not sede_canon:
+                continue
+            sede_coord = SEDE_COORDS.get(sede_canon)
+            if not sede_coord:
+                continue
+            dist = _distancia_km_aprox(dep_coord, sede_coord)
+            if dist < mejor_dist:
+                mejor_dist = dist
+                mejor_op = op
+
+        if mejor_dist != float("inf"):
+            return mejor_op, f"dropdown:geocercana:{mejor_dist:.1f}km"
+
+    # Fallback final: si no hay coordenadas suficientes, usar primera opción disponible.
+    return mejor_op, "dropdown:fallback_primera"
+
+
+def resolver_sede_atencion_desde_departamento(departamento: str) -> tuple[str, str]:
+    """Devuelve (sede, origen) a partir del departamento de la hoja base."""
+    dep_norm = _normalizar_departamento(departamento)
+    if not dep_norm:
+        return "LIMA", "default"
+
+    mapa_directo = {_normalizar_departamento(k): v for k, v in DEPARTAMENTO_A_SEDE.items()}
+    if dep_norm in mapa_directo:
+        return mapa_directo[dep_norm], "directa"
+
+    mapa_fallback = {_normalizar_departamento(k): v for k, v in DEPARTAMENTO_FALLBACK_POR_REGION.items()}
+    for candidato_norm, sede in mapa_fallback.items():
+        if candidato_norm and candidato_norm in dep_norm:
+            return sede, f"fallback:{candidato_norm}"
+
+    return "LIMA", "default"
+
+
+def seleccionar_opcion_primefaces(page, trigger_selector: str, panel_selector: str, label_selector: str, valor: str, nombre_campo: str) -> None:
+    trigger = page.locator(trigger_selector)
+    panel = page.locator(panel_selector)
+
+    # Patrón robusto tipo example.py: trigger principal y fallback al label.
+    try:
+        trigger.wait_for(state="visible", timeout=6000)
+        trigger.click()
+    except PlaywrightTimeoutError:
+        label_fallback = page.locator(label_selector)
+        label_fallback.wait_for(state="visible", timeout=6000)
+        label_fallback.click()
+
+    panel.wait_for(state="visible", timeout=7000)
+
+    # Intento 1: coincidencia exacta por data-label.
+    opcion = panel.locator(f'li.ui-selectonemenu-item[data-label="{valor}"]')
+    try:
+        opcion.wait_for(state="visible", timeout=1800)
+        opcion.first.click()
+    except PlaywrightTimeoutError:
+        # Intento 2: búsqueda flexible por texto visible.
+        items = panel.locator("li.ui-selectonemenu-item")
+        total = items.count()
+        if total == 0:
+            raise Exception(f"No hay opciones visibles en {nombre_campo}")
+
+        objetivo = _normalizar_columna(valor)
+        item_match = None
+        opciones = []
+        for idx in range(total):
+            item = items.nth(idx)
+            texto = str(item.get_attribute("data-label") or item.inner_text() or "").strip()
+            if texto:
+                opciones.append(texto)
+            texto_norm = _normalizar_columna(texto)
+            if objetivo == texto_norm or objetivo in texto_norm or texto_norm in objetivo:
+                item_match = item
+                break
+
+        if item_match is None:
+            raise Exception(f"No se encontró opción para {nombre_campo}: '{valor}'. Opciones: {opciones}")
+        item_match.click()
+
+    page.wait_for_timeout(220)
+    label = str(page.locator(label_selector).inner_text() or "").strip()
+    objetivo = _normalizar_columna(valor)
+    label_norm = _normalizar_columna(label)
+    if not label_norm or (objetivo != label_norm and objetivo not in label_norm):
+        raise Exception(f"No se confirmó {nombre_campo}. Esperado '{valor}' | Actual '{label}'")
+
+
+def seleccionar_sede_atencion(page, sede: str) -> None:
+    seleccionar_opcion_primefaces(
+        page,
+        trigger_selector=SEL["crear_solicitud_sede_trigger"],
+        panel_selector=SEL["crear_solicitud_sede_panel"],
+        label_selector=SEL["crear_solicitud_sede_label"],
+        valor=sede,
+        nombre_campo="Sede de Atención",
+    )
+
+
+def procesar_registro_cruce_en_formulario(page, logger: logging.Logger, item: dict) -> bool:
+    """Aplica la sede de atención y actualiza la fila de comparación para un registro individual."""
+    compare_url = str(item.get("compare_url", "") or "").strip()
+    compare_row_number = int(item.get("compare_row_number", 0) or 0)
+    compare_fieldnames = item.get("compare_fieldnames", []) or []
+    fecha_hoy = str(item.get("fecha_tramite", "") or datetime.now().strftime("%d/%m/%Y")).strip()
+    base_row = item.get("base_row")
+    dni = str(item.get("dni", "") or "").strip()
+
+    if not base_row:
+        if compare_url and compare_row_number > 0:
+            _actualizar_fila_comparacion_por_row(
+                logger,
+                compare_url,
+                compare_row_number,
+                {
+                    "observacion": f"DNI {dni} no encontrado en la hoja base",
+                    "fecha tramite": fecha_hoy,
+                },
+                fieldnames=compare_fieldnames,
+            )
+        return False
+
+    sede_sugerida = str(item.get("sede", "") or "").strip() or "LIMA"
+    sede = sede_sugerida
+    origen_dropdown = "no_verificado_dropdown"
+    if page is not None:
+        sede, origen_dropdown = resolver_sede_para_dropdown(
+            page,
+            str(item.get("departamento", "") or "").strip(),
+            sede_sugerida,
+        )
+
+    logger.info(
+        "[FORM] DNI=%s | DEPARTAMENTO=%s | SEDE_SUGERIDA=%s | SEDE_APLICADA=%s | ORIGEN=%s | ORIGEN_DROPDOWN=%s",
+        dni,
+        item.get("departamento", ""),
+        sede_sugerida,
+        sede,
+        item.get("origen_sede", ""),
+        origen_dropdown,
+    )
+    seleccionar_sede_atencion(page, sede)
+    logger.info("[FORM] Sede de atención aplicada en la vista: %s", sede)
+
+    if compare_url and compare_row_number > 0:
+        _actualizar_fila_comparacion_por_row(
+            logger,
+            compare_url,
+            compare_row_number,
+            {
+                "observacion": "",
+                "fecha tramite": fecha_hoy,
+            },
+            fieldnames=compare_fieldnames,
+        )
+
+    return True
+
+
+def previsualizar_mapeo_sedes_desde_hoja_base(logger: logging.Logger, max_rows: int = 5) -> None:
+    """Muestra cómo quedaría el mapeo departamento -> sede para los primeros registros de prueba."""
+    url_base = str(os.getenv("CARNET_GSHEET_URL", DEFAULT_GSHEET_URL) or DEFAULT_GSHEET_URL).strip()
+    rows, fields = _leer_google_sheet_rows(url_base, logger)
+    col_dni = _resolver_columna(fields, ["dni"])
+    col_departamento = _resolver_columna(
+        fields,
+        [
+            "indicar el departamento donde labora o donde postuló",
+            "indicar el departamento donde labora o donde postulo",
+            "departamento",
+        ],
+    )
+
+    if not col_departamento:
+        logger.warning("[SEDE] No se encontró la columna de departamento en la hoja base")
+        return
+
+    limite = max(1, int(max_rows or 5))
+    vistos = 0
+    for row in rows:
+        departamento = str(row.get(col_departamento, "") or "").strip()
+        dni = str(row.get(col_dni, "") or "").strip() if col_dni else ""
+        if not departamento and not dni:
+            continue
+
+        sede, origen = resolver_sede_atencion_desde_departamento(departamento)
+        logger.info(
+            "[SEDE] Muestra %s | DNI=%s | DEPARTAMENTO=%s | SEDE=%s | ORIGEN=%s",
+            vistos + 1,
+            dni,
+            departamento,
+            sede,
+            origen,
+        )
+        vistos += 1
+        if vistos >= limite:
+            break
+
+    if vistos == 0:
+        logger.warning("[SEDE] No se encontraron filas válidas para previsualizar el mapeo")
 
 
 def _drive_root_folder_id() -> str:
@@ -842,7 +1536,7 @@ def validar_drive_por_dni(logger: logging.Logger, dni: str, required_names: list
 
 def prevalidar_drive_desde_hoja(logger: logging.Logger, max_rows: int = 5) -> None:
     """Prevalida Drive por los primeros DNIs detectados en la hoja base, sin interrumpir el flujo."""
-    if _as_bool_env("DRIVE_VALIDATE_ON_START", default=True) is False:
+    if _as_bool_env("DRIVE_VALIDATE_ON_START", default=DEFAULT_DRIVE_VALIDATE_ON_START == "1") is False:
         return
 
     try:
@@ -885,7 +1579,7 @@ def comparar_dnis_entre_hojas(logger: logging.Logger, max_rows: int = 5) -> None
     col_cmp_dni = _resolver_columna(fields_compare, ["dni"])
     col_cmp_compania = _resolver_columna(fields_compare, ["compania", "compañia", "empresa"])
     col_base_estado = _resolver_columna(fields_base, ["estado"])
-    col_cmp_estado = _resolver_columna(fields_compare, ["estado"])
+    col_cmp_estado = _resolver_columna(fields_compare, ["estado_tramite"])
     col_base_obs = _resolver_columna(fields_base, ["observacion", "observaciones", "observ", "obs"])
     col_cmp_obs = _resolver_columna(fields_compare, ["observacion", "observaciones", "observ", "obs"])
     col_cmp_responsable = _resolver_columna(fields_compare, ["responsable"])
@@ -1046,10 +1740,7 @@ def navegar_dssp_carne_crear_solicitud(page, logger: logging.Logger) -> None:
             except Exception:
                 pass
             esperar_ajax_primefaces(page, timeout_ms=5000)
-            if validar_vista_crear_solicitud_por_ui(page, timeout_ms=2200):
-                logger.info("Vista CREAR SOLICITUD confirmada por UI")
-            else:
-                logger.warning("No se pudo confirmar la vista CREAR SOLICITUD por UI, pero el click JSF fue ejecutado")
+            logger.info("Click JSF en CREAR SOLICITUD ejecutado (sin validación de vista por UI)")
             return
     except Exception:
         pass
@@ -1105,17 +1796,30 @@ def navegar_dssp_carne_crear_solicitud(page, logger: logging.Logger) -> None:
     except Exception:
         pass
     esperar_ajax_primefaces(page, timeout_ms=6000)
-    if validar_vista_crear_solicitud_por_ui(page, timeout_ms=2600):
-        logger.info("Vista CREAR SOLICITUD confirmada por UI")
-    else:
-        logger.warning("No se pudo confirmar la vista CREAR SOLICITUD por UI tras la navegación")
-    logger.info("Click en CREAR SOLICITUD")
+    logger.info("Click en CREAR SOLICITUD ejecutado (sin validación de vista por UI)")
 
 
-def preparar_flujo_emision_carnet(logger: logging.Logger, page, grupo: str) -> None:
+def preparar_flujo_emision_carnet(logger: logging.Logger, page, grupo: str, registro_formulario: dict | None = None) -> None:
     logger.info("Login correcto para grupo %s. Continúa el flujo de emisión de carnet.", grupo)
     navegar_dssp_carne_crear_solicitud(page, logger)
+    if registro_formulario is not None:
+        procesar_registro_cruce_en_formulario(page, logger, registro_formulario)
+    elif _as_bool_env("CARNET_FORM_PRUEBA", default=True):
+        ejecutar_prueba_cruce_y_sede_en_formulario(
+            page,
+            logger,
+            max_rows=max(1, _safe_int_env("CARNET_FORM_PRUEBA_ROWS", 1)),
+        )
     logger.info("URL post-login: %s", page.url)
+
+
+def obtener_grupo_ruc(valor: str) -> str:
+    base = _normalizar_columna(valor).upper()
+    if "SELVA" in base or "20493762789" in base:
+        return "SELVA"
+    if "J&V" in base or "J V" in base or "RESGUARDO" in base or "20100901481" in base:
+        return "JV"
+    return "OTRO"
 
 
 def resolver_grupos_objetivo() -> list:
@@ -1134,13 +1838,24 @@ def credenciales_por_grupo(grupo: str) -> dict:
     return CREDENCIALES_JV
 
 
-def ejecutar_login_grupo(playwright, logger: logging.Logger, grupo: str):
+def ejecutar_login_grupo(
+    playwright,
+    logger: logging.Logger,
+    grupo: str,
+    registro_formulario: dict | None = None,
+    keep_browser_open_on_finish: bool = False,
+):
     credenciales = credenciales_por_grupo(grupo)
     validar_credenciales_configuradas(credenciales, grupo)
 
     hold_browser_open = _as_bool_env("HOLD_BROWSER_OPEN", default=False)
     headless = _as_bool_env("CARNET_HEADLESS", default=False)
     login_validation_timeout_ms = max(1000, _safe_int_env("LOGIN_VALIDATION_TIMEOUT_MS", 12000))
+    keep_open_now = bool(
+        (keep_browser_open_on_finish or hold_browser_open)
+        and (not _is_scheduled_mode())
+        and (not headless)
+    )
 
     browser = None
     context = None
@@ -1180,9 +1895,9 @@ def ejecutar_login_grupo(playwright, logger: logging.Logger, grupo: str):
             raise Exception(f"[{grupo}] Login fallido: {msg_error}")
 
         logger.info("[%s] Login exitoso en %.2fs", grupo, tiempo)
-        preparar_flujo_emision_carnet(logger, page, grupo)
+        preparar_flujo_emision_carnet(logger, page, grupo, registro_formulario=registro_formulario)
 
-        if hold_browser_open and not _is_scheduled_mode():
+        if keep_open_now:
             logger.info("[%s] HOLD_BROWSER_OPEN=1. Esperando Ctrl+C", grupo)
             try:
                 while True:
@@ -1191,13 +1906,63 @@ def ejecutar_login_grupo(playwright, logger: logging.Logger, grupo: str):
                 logger.info("[%s] Interrupción manual detectada", grupo)
     finally:
         try:
-            if context is not None:
+            if context is not None and not keep_open_now:
                 context.close()
         except Exception:
             pass
         try:
-            if browser is not None:
+            if browser is not None and not keep_open_now:
                 browser.close()
+        except Exception:
+            pass
+
+
+def _ejecutar_flujo_fila_por_fila(logger: logging.Logger, max_rows: int = 1) -> int:
+    """Procesa los registros pendientes uno por uno, sin agrupar por grupo."""
+    pendientes = _cargar_cruce_pendiente_desde_hojas(logger, max_rows=max_rows)
+    if not pendientes:
+        logger.warning("[CRUCE] No hay registros pendientes para procesar uno por uno")
+        return 0
+
+    playwright = sync_playwright().start()
+    try:
+        hold_final = _as_bool_env("CARNET_HOLD_BROWSER_ON_FINISH", default=True)
+        for idx, item in enumerate(pendientes, start=1):
+            base_row = item.get("base_row")
+            if not base_row:
+                procesar_registro_cruce_en_formulario(None, logger, item)
+                continue
+
+            grupo = obtener_grupo_ruc(str(base_row.get("ruc", "") or item.get("departamento", "") or ""))
+            if grupo == "OTRO":
+                grupo = obtener_grupo_ruc(str(base_row.get("compania", "") or "JV"))
+            if grupo == "OTRO":
+                grupo = "JV"
+
+            logger.info(
+                "[FILA %s] DNI=%s | GRUPO=%s | DEPARTAMENTO=%s | SEDE=%s | ORIGEN=%s | CRUCE_BASE_FILA=%s",
+                idx,
+                item.get("dni", ""),
+                grupo,
+                item.get("departamento", ""),
+                item.get("sede", ""),
+                item.get("origen_sede", ""),
+                item.get("base_row_number", 0),
+            )
+            mantener_abierto_en_esta_fila = bool(
+                hold_final and idx == len(pendientes) and (not _is_scheduled_mode())
+            )
+            ejecutar_login_grupo(
+                playwright,
+                logger,
+                grupo,
+                registro_formulario=item,
+                keep_browser_open_on_finish=mantener_abierto_en_esta_fila,
+            )
+        return 0
+    finally:
+        try:
+            playwright.stop()
         except Exception:
             pass
 
@@ -1221,6 +1986,7 @@ def ejecutar_flujo_secundario() -> int:
                 ("puesto", ["puesto"]),
             ]
             imprimir_muestra_google_sheet_desde_url(logger, url_base, "HOJA_BASE", max_rows=max_rows, esquema_columnas=esquema_base)
+            previsualizar_mapeo_sedes_desde_hoja_base(logger, max_rows=max_rows)
 
             url_compare = str(os.getenv("CARNET_GSHEET_COMPARE_URL", DEFAULT_GSHEET_COMPARE_URL) or "").strip()
             if url_compare:
@@ -1228,7 +1994,7 @@ def ejecutar_flujo_secundario() -> int:
                     ("compania", ["compania", "compañia", "empresa"]),
                     ("dni", ["dni"]),
                     ("responsable", ["responsable"]),
-                    ("estado", ["estado"]),
+                    ("estado", ["estado_tramite"]),
                     ("observacion", ["observacion", "observaciones", "observ", "obs"]),
                     ("fecha_tramite", ["fecha tramite", "fecha_tramite", "fechatramite", "fecha trámite"]),
                 ]
@@ -1269,6 +2035,12 @@ def ejecutar_flujo_secundario() -> int:
         validar_drive_acceso_raiz(logger)
         logger.info("DRIVE_VALIDATE_ONLY=1 -> finaliza tras validar la carpeta raíz de Drive")
         return 0
+
+    if _as_bool_env("CARNET_ROW_BY_ROW", default=True):
+        return _ejecutar_flujo_fila_por_fila(
+            logger,
+            max_rows=max(1, _safe_int_env("CARNET_FORM_PRUEBA_ROWS", 1)),
+        )
 
     grupos = resolver_grupos_objetivo()
     group_override = str(os.getenv("WORKER_GROUP", "") or "").strip().upper()
