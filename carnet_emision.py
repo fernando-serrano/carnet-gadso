@@ -2092,7 +2092,13 @@ def procesar_registro_cruce_en_formulario(page, logger: logging.Logger, item: di
             logger.warning("[FORM] Candidato %s sin secuencia; saltando", intento_num)
             continue
         
-        logger.info("[FORM] Intento secuencia %s/%s: %s", intento_num, len(secuencia_candidatos), nro_sec)
+        logger.info(
+            "[FORM] Intento secuencia %s/%s: %s | TERCERA_FILA=%s",
+            intento_num,
+            len(secuencia_candidatos),
+            nro_sec,
+            tercera_row if tercera_row > 0 else "N/A",
+        )
         limpiar_buffer_carnet_growl(page)
         ts_intento_ms = int(time.time() * 1000)
         ingresar_copia_secuencia_pago(page, nro_sec)
@@ -2102,14 +2108,22 @@ def procesar_registro_cruce_en_formulario(page, logger: logging.Logger, item: di
         resultado, msg = detectar_resultado_verificacion_comprobante(page, max_wait_ms=6000, min_ts_ms=ts_intento_ms)
         
         if resultado == "ENCONTRADO":
-            logger.info("[FORM] [OK] SECUENCIA %s VALIDA EN SUCAMEC", nro_sec)
+            logger.info(
+                "[FORM] [OK] SECUENCIA %s VALIDA EN SUCAMEC | TERCERA_FILA=%s",
+                nro_sec,
+                tercera_row if tercera_row > 0 else "N/A",
+            )
             secuencia_exitosa = True
             item["copia_secuencia_pago"] = nro_sec
             item["copia_secuencia_pago_raw"] = nro_sec_raw
             item["tercera_row_number"] = tercera_row
             break
         elif resultado == "NO_ENCONTRADO":
-            logger.warning("[FORM] [ERROR] SECUENCIA %s NO ENCONTRADA EN SUCAMEC", nro_sec)
+            logger.warning(
+                "[FORM] [ERROR] SECUENCIA %s NO ENCONTRADA EN SUCAMEC | TERCERA_FILA=%s",
+                nro_sec,
+                tercera_row if tercera_row > 0 else "N/A",
+            )
             # Marcar en tercera hoja si existe
             if tercera_url and tercera_row > 0:
                 try:
