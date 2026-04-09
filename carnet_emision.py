@@ -1748,6 +1748,41 @@ def obtener_buffer_carnet_growl(page) -> list:
         return []
 
 
+def limpiar_buffer_carnet_growl(page) -> None:
+    """Limpia el buffer de mensajes growl capturados en memoria JS."""
+    try:
+        page.evaluate("() => { window.__carnetGrowlBuffer = []; }")
+    except Exception:
+        pass
+
+
+def _detectar_etiqueta_recibo_valido(page) -> str:
+    """
+    Detecta la etiqueta que aparece cuando el recibo es valido:
+    "Monto: S/. <valor>, Fecha: <dd/mm/aaaa>".
+    """
+    patron = re.compile(r"monto\s*:\s*s/\.\s*\d+(?:\.\d+)?\s*,\s*fecha\s*:\s*\d{2}/\d{2}/\d{4}", re.IGNORECASE)
+
+    try:
+        labels = page.locator("#createForm label.ui-outputlabel.ui-widget").all()
+        for lbl in labels:
+            txt = (lbl.inner_text() or "").strip()
+            if txt and patron.search(txt):
+                return txt
+    except Exception:
+        pass
+
+    try:
+        html = page.content() or ""
+        m = patron.search(html)
+        if m:
+            return m.group(0)
+    except Exception:
+        pass
+
+    return ""
+
+
 def detectar_mensaje_carne_cesado(page, max_wait_ms: int = 5000) -> tuple[bool, str]:
     """
     Detecta si hay un mensaje de carné cesado post-Buscar con POLLING ACTIVO.
@@ -1847,7 +1882,7 @@ def reintentar_busqueda_con_cambio_empresa(page, logger: logging.Logger, dni: st
     logger.info("[SUB-VALIDACION] Búsqueda reintentada con CAMBIO DE EMPRESA")
 
 
-def detectar_resultado_verificacion_comprobante(page, max_wait_ms: int = 5000) -> tuple[str, str]:
+def detectar_resultado_verificacion_comprobante(page, max_wait_ms: int = 5000, min_ts_ms: int | None = None) -> tuple[str, str]:
     """
     Detecta el resultado de click al botón Verificar (Comprobante).
     
@@ -1856,7 +1891,8 @@ def detectar_resultado_verificacion_comprobante(page, max_wait_ms: int = 5000) -
     - ("NO_ENCONTRADO", "No se encontró el recibo") → Error, fallback
     - ("TIMEOUT", "") → No se detectó nada en tiempo límite
     
-    Usa polling activo con estrategia multinivel (Buffer JS + DOM + HTML).
+    Usa polling activo con estrategia multinivel (Etiqueta Monto/Fecha + Buffer JS + DOM + HTML).
+    Si min_ts_ms se define, ignora mensajes del buffer growl anteriores a ese timestamp.
     """
     deadline = time.time() + (max(0, int(max_wait_ms)) / 1000.0)
     
@@ -1864,10 +1900,22 @@ def detectar_resultado_verificacion_comprobante(page, max_wait_ms: int = 5000) -
         if time.time() >= deadline:
             return "TIMEOUT", ""
         
+        # 0. Validación positiva robusta por etiqueta de monto/fecha.
+        etiqueta_ok = _detectar_etiqueta_recibo_valido(page)
+        if etiqueta_ok:
+            return "ENCONTRADO", etiqueta_ok
+
         # 1. Buffer JS
         try:
             buffer = obtener_buffer_carnet_growl(page) or []
             for msg_dict in buffer:
+                if min_ts_ms is not None:
+                    try:
+                        ts = int(msg_dict.get("ts", 0) or 0)
+                        if ts and ts < int(min_ts_ms):
+                            continue
+                    except Exception:
+                        pass
                 msg_text = str(msg_dict.get("text", "") or "").lower()
                 if "recibo encontrado" in msg_text:
                     return "ENCONTRADO", "Recibo encontrado"
@@ -2045,11 +2093,13 @@ def procesar_registro_cruce_en_formulario(page, logger: logging.Logger, item: di
             continue
         
         logger.info("[FORM] Intento secuencia %s/%s: %s", intento_num, len(secuencia_candidatos), nro_sec)
+        limpiar_buffer_carnet_growl(page)
+        ts_intento_ms = int(time.time() * 1000)
         ingresar_copia_secuencia_pago(page, nro_sec)
         
         # Esperar AJAX y detectar resultado (AMBOS mensajes)
         page.wait_for_timeout(800)
-        resultado, msg = detectar_resultado_verificacion_comprobante(page, max_wait_ms=6000)
+        resultado, msg = detectar_resultado_verificacion_comprobante(page, max_wait_ms=6000, min_ts_ms=ts_intento_ms)
         
         if resultado == "ENCONTRADO":
             logger.info("[FORM] [OK] SECUENCIA %s VALIDA EN SUCAMEC", nro_sec)
