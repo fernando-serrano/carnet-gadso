@@ -81,6 +81,16 @@ SEL = {
     "crear_solicitud_modalidad_trigger": '#createForm\\:modalidad .ui-selectonemenu-trigger',
     "crear_solicitud_modalidad_label": '#createForm\\:modalidad_label',
     "crear_solicitud_modalidad_panel": '#createForm\\:modalidad_panel',
+    "crear_solicitud_tipo_registro_trigger": '#createForm\\:tipoRegistro .ui-selectonemenu-trigger',
+    "crear_solicitud_tipo_registro_label": '#createForm\\:tipoRegistro_label',
+    "crear_solicitud_tipo_registro_panel": '#createForm\\:tipoRegistro_panel',
+    "crear_solicitud_tipo_doc_trigger": '#createForm\\:tipoDoc .ui-selectonemenu-trigger',
+    "crear_solicitud_tipo_doc_label": '#createForm\\:tipoDoc_label',
+    "crear_solicitud_tipo_doc_panel": '#createForm\\:tipoDoc_panel',
+    "crear_solicitud_nro_secuencia_input": '#createForm\\:nroSecuencia',
+    "crear_solicitud_verificar_recibo_button": '#createForm\\:btnBuscarRecibo',
+    "crear_solicitud_documento_input": "#createForm\\:numDoc",
+    "crear_solicitud_buscar_button": "#createForm\\:btnBuscarVigilante",
 }
 
 SUCCESS_SELECTORS = [
@@ -237,11 +247,51 @@ def ensure_directories() -> None:
         path.mkdir(parents=True, exist_ok=True)
 
 
+def _truncate_log_if_exceeds_lines(log_file: Path, max_lines: int) -> bool:
+    """Limpia el archivo si supera el umbral de líneas. Retorna True si truncó."""
+    try:
+        if not log_file.exists():
+            return False
+
+        total = 0
+        with log_file.open("r", encoding="utf-8", errors="replace") as f:
+            for _ in f:
+                total += 1
+                if total > max_lines:
+                    break
+
+        if total > max_lines:
+            log_file.write_text("", encoding="utf-8")
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def setup_logger(name: str = "carnet_emision", suffix: str = "") -> logging.Logger:
     ensure_directories()
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     suffix_clean = f"_{suffix}" if suffix else ""
-    log_file = LOGS_DIR / f"{name}{suffix_clean}_{stamp}.log"
+
+    # Política recomendada para servidor: archivo único y limpieza al inicio.
+    single_file_raw = str(os.getenv("CARNET_LOG_SINGLE_FILE", "1") or "1").strip().lower()
+    single_file = single_file_raw in {"1", "true", "yes", "si", "sí", "on"}
+
+    try:
+        max_lines = int(str(os.getenv("CARNET_LOG_MAX_LINES", "10000") or "10000").strip())
+    except Exception:
+        max_lines = 10000
+    max_lines = max(1000, max_lines)
+
+    if single_file:
+        log_file_name = str(os.getenv("CARNET_LOG_FILE_NAME", "carnet_emision.log") or "carnet_emision.log").strip()
+        if not log_file_name:
+            log_file_name = "carnet_emision.log"
+        log_file = LOGS_DIR / log_file_name
+        was_truncated = _truncate_log_if_exceeds_lines(log_file, max_lines=max_lines)
+    else:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_file = LOGS_DIR / f"{name}{suffix_clean}_{stamp}.log"
+        was_truncated = False
 
     logger = logging.getLogger(f"{name}{suffix_clean}")
     logger.setLevel(logging.INFO)
@@ -257,6 +307,8 @@ def setup_logger(name: str = "carnet_emision", suffix: str = "") -> logging.Logg
     sh.setFormatter(formatter)
     logger.addHandler(sh)
 
+    if was_truncated:
+        logger.info("Log único truncado por umbral de líneas: %s (max=%s)", log_file, max_lines)
     logger.info("Log inicializado en %s", log_file)
     return logger
 
@@ -900,6 +952,19 @@ def _actualizar_fila_comparacion_por_row(logger: logging.Logger, compare_url: st
     _update_sheet_cells_by_row(service, spreadsheet_id, sheet_title, row_number, updates, fieldnames)
 
 
+def _actualizar_fila_tercera_hoja_por_row(logger: logging.Logger, tercera_url: str, row_number: int, updates: dict[str, str], fieldnames: list[str] | None = None) -> None:
+    """Actualiza una fila en la tercera hoja (Secuencias de Pago)."""
+    service = _google_sheets_service()
+    spreadsheet_id = _extract_sheet_id_from_url(tercera_url)
+    gid = _extract_gid_from_url(tercera_url)
+    sheet_title = _sheet_title_from_gid(service, spreadsheet_id, gid)
+
+    if fieldnames is None:
+        _, fieldnames = _leer_google_sheet_rows(tercera_url, logger)
+
+    _update_sheet_cells_by_row(service, spreadsheet_id, sheet_title, row_number, updates, fieldnames)
+
+
 def _estado_comparacion_es_objetivo(estado: str, estados_objetivo: set[str], permitir_vacio: bool) -> bool:
     valor = _normalizar_columna(estado)
     if not valor:
@@ -910,11 +975,16 @@ def _estado_comparacion_es_objetivo(estado: str, estados_objetivo: set[str], per
 def _cargar_cruce_pendiente_desde_hojas(logger: logging.Logger, max_rows: int = 1) -> list[dict]:
     url_base = str(os.getenv("CARNET_GSHEET_URL", DEFAULT_GSHEET_URL) or DEFAULT_GSHEET_URL).strip()
     url_compare = str(os.getenv("CARNET_GSHEET_COMPARE_URL", DEFAULT_GSHEET_COMPARE_URL) or "").strip()
+    url_third = str(os.getenv("CARNET_GSHEET_THIRD_URL", DEFAULT_GSHEET_THIRD_URL) or "").strip()
     if not url_compare:
-        raise Exception("Falta CARNET_GSHEET_COMPARE_URL para procesar el cruce")
+        raise Exception("Falta s" \
+        "CARNET_GSHEET_COMPARE_URL para procesar el cruce")
 
     rows_base, fields_base = _leer_google_sheet_rows(url_base, logger)
     rows_compare, fields_compare = _leer_google_sheet_rows(url_compare, logger)
+    rows_third, fields_third = ([], [])
+    if url_third:
+        rows_third, fields_third = _leer_google_sheet_rows(url_third, logger)
 
     col_base_dni = _resolver_columna(fields_base, ["dni"])
     col_base_departamento = _resolver_columna(
@@ -930,11 +1000,52 @@ def _cargar_cruce_pendiente_desde_hojas(logger: logging.Logger, max_rows: int = 
     col_cmp_estado = _resolver_columna(fields_compare, ["estado_tramite"])
     col_cmp_obs = _resolver_columna(fields_compare, ["observacion"])
     col_cmp_fecha = _resolver_columna(fields_compare, ["fecha tramite"])
+    col_third_dni = _resolver_columna(fields_third, ["dni"])
+    col_third_copia = _resolver_columna(fields_third, ["copia de secuencia de pago", "copia secuencia de pago", "secuencia de pago"])
+    col_third_estado_sec = _resolver_columna(
+        fields_third,
+        ["estado secuencia de pago", "estado secuencia pago", "estado_secuencia_pago", "estado secuencia"],
+    )
 
     if not col_base_dni or not col_base_departamento:
         raise Exception("La hoja base no contiene DNI y/o departamento")
     if not col_cmp_dni:
         raise Exception("La hoja de comparación no contiene DNI")
+
+    terceros_libres = []
+    terceros_omitidos_usado = 0
+    terceros_omitidos_estado_no_vacio = 0
+    if url_third and col_third_dni:
+        for third_idx, row in enumerate(rows_third, start=2):
+            dni_third = str(row.get(col_third_dni, "") or "").strip()
+            copia_third = str(row.get(col_third_copia, "") or "").strip() if col_third_copia else ""
+            estado_sec_raw = str(row.get(col_third_estado_sec, "") or "").strip() if col_third_estado_sec else ""
+            estado_sec_norm = _normalizar_columna(estado_sec_raw)
+
+            # Disponibilidad estricta: DNI vacío y Estado Secuencia de Pago vacío.
+            if estado_sec_norm == "usado":
+                terceros_omitidos_usado += 1
+                continue
+            if estado_sec_norm:
+                terceros_omitidos_estado_no_vacio += 1
+                continue
+
+            if not dni_third and copia_third:
+                terceros_libres.append({
+                    "row": row,
+                    "row_number": third_idx,
+                    "copia_secuencia_pago_raw": copia_third,
+                    "copia_secuencia_pago": normalizar_copia_secuencia_pago(copia_third),
+                    "estado_secuencia_pago": estado_sec_raw,
+                })
+
+    if url_third:
+        logger.info(
+            "[CRUCE][TERCERA] Disponibles=%s | OmitidosEstadoUSADO=%s | OmitidosEstadoNoVacio=%s",
+            len(terceros_libres),
+            terceros_omitidos_usado,
+            terceros_omitidos_estado_no_vacio,
+        )
 
     estados_objetivo_env = str(os.getenv("CARNET_COMPARE_ESTADOS_OBJETIVO", "PENDIENTE") or "PENDIENTE")
     estados_objetivo = {
@@ -963,6 +1074,7 @@ def _cargar_cruce_pendiente_desde_hojas(logger: logging.Logger, max_rows: int = 
     pendientes = []
     registros_saltados_sin_dni = 0
     registros_saltados_estado_fuera_criterio = 0
+    indice_comprobante_libre = 0
     
     for idx, row in enumerate(rows_compare, start=2):
         dni = str(row.get(col_cmp_dni, "") or "").strip()
@@ -984,10 +1096,20 @@ def _cargar_cruce_pendiente_desde_hojas(logger: logging.Logger, max_rows: int = 
         puesto = str(base_row.get(col_base_puesto, "") or "").strip() if (base_row and col_base_puesto) else ""
         sede, origen_sede = resolver_sede_atencion_desde_departamento(departamento)
         modalidad_objetivo, modalidad_origen = resolver_modalidad_desde_puesto(puesto)
+        tipo_doc_objetivo, dni_normalizado_tipo_doc, tipo_doc_origen = resolver_tipo_documento_desde_dni(dni)
+        comprobante_libre = terceros_libres[indice_comprobante_libre] if indice_comprobante_libre < len(terceros_libres) else None
+        copia_secuencia_pago_raw = str(comprobante_libre.get("copia_secuencia_pago_raw", "") or "").strip() if comprobante_libre else ""
+        copia_secuencia_pago = str(comprobante_libre.get("copia_secuencia_pago", "") or "").strip() if comprobante_libre else ""
+        estado_secuencia_pago = str(comprobante_libre.get("estado_secuencia_pago", "") or "").strip() if comprobante_libre else ""
+        tercera_row_number = int(comprobante_libre.get("row_number", 0) or 0) if comprobante_libre else 0
+        nro_secuencia_objetivo = copia_secuencia_pago
+        nro_secuencia_origen = "tercera_hoja:libre" if copia_secuencia_pago else "tercera_hoja:no_disponible"
+        if copia_secuencia_pago:
+            indice_comprobante_libre += 1
 
         if base_row:
             logger.info(
-                "[CRUCE][OK] COMP_FILA=%s | DNI=%s | BASE_FILA=%s | BASE_TOTAL=%s | DEPARTAMENTO=%s | PUESTO=%s | MODALIDAD_OBJETIVO=%s",
+                "[CRUCE][OK] COMP_FILA=%s | DNI=%s | BASE_FILA=%s | BASE_TOTAL=%s | DEPARTAMENTO=%s | PUESTO=%s | MODALIDAD_OBJETIVO=%s | TIPO_DOC_OBJETIVO=%s | DNI_NORMALIZADO=%s | COPIA_SEC_PAGO_RAW=%s | COPIA_SEC_PAGO_APLICADA=%s | ESTADO_SECUENCIA_PAGO=%s | NRO_SEC_ORIGEN=%s | TERCERA_FILA=%s",
                 idx,
                 dni,
                 base_row_number,
@@ -995,6 +1117,13 @@ def _cargar_cruce_pendiente_desde_hojas(logger: logging.Logger, max_rows: int = 
                 departamento,
                 puesto,
                 modalidad_objetivo,
+                tipo_doc_objetivo,
+                dni_normalizado_tipo_doc,
+                copia_secuencia_pago_raw,
+                copia_secuencia_pago,
+                estado_secuencia_pago,
+                nro_secuencia_origen,
+                tercera_row_number,
             )
         else:
             logger.warning(
@@ -1017,7 +1146,21 @@ def _cargar_cruce_pendiente_desde_hojas(logger: logging.Logger, max_rows: int = 
                 "origen_sede": origen_sede,
                 "modalidad_objetivo": modalidad_objetivo,
                 "modalidad_origen": modalidad_origen,
+                "tipo_doc_objetivo": tipo_doc_objetivo,
+                "dni_normalizado_tipo_doc": dni_normalizado_tipo_doc,
+                "tipo_doc_origen": tipo_doc_origen,
+                "copia_secuencia_pago_raw": copia_secuencia_pago_raw,
+                "copia_secuencia_pago": copia_secuencia_pago,
+                "nro_secuencia_objetivo": nro_secuencia_objetivo,
+                "nro_secuencia_origen": nro_secuencia_origen,
+                "tercera_row_number": tercera_row_number,
+                "estado_secuencia_pago": estado_secuencia_pago,
+                "terceros_libres": terceros_libres,
+                "indice_comprobante_libre_actual": indice_comprobante_libre,
                 "fieldnames_compare": fields_compare,
+                "fieldnames_third": fields_third,
+                "col_third_estado_sec": col_third_estado_sec,
+                "tercera_url": url_third,
                 "col_cmp_obs": col_cmp_obs,
                 "col_cmp_fecha": col_cmp_fecha,
             }
@@ -1277,6 +1420,54 @@ def resolver_modalidad_para_dropdown(page, modalidad_objetivo: str) -> tuple[str
     return opciones[0], "modalidad:dropdown:fallback_primera"
 
 
+def resolver_tipo_registro_para_flujo() -> tuple[str, str]:
+    """Sub-iteración actual: mantener siempre INICIAL."""
+    return "INICIAL", "sub_iteracion_1:fijo_inicial"
+
+
+def resolver_tipo_documento_desde_dni(dni_raw: str) -> tuple[str, str, str]:
+    """
+    Resuelve tipo de documento para el dropdown desde el campo DNI de hoja comparación.
+    Regla: 8 dígitos -> DNI, 9 dígitos -> CE.
+    Incluye normalización defensiva por ceros al inicio/fin.
+    """
+    digits = "".join(ch for ch in str(dni_raw or "") if ch.isdigit())
+
+    candidatos = [
+        ("exacto", digits),
+        ("trim_ceros_fin", digits.rstrip("0")),
+        ("trim_ceros_inicio", digits.lstrip("0")),
+        ("trim_ceros_extremos", digits.strip("0")),
+    ]
+    for origen, candidato in candidatos:
+        if len(candidato) == 8:
+            return "DNI", candidato, f"tipo_doc:{origen}:len8"
+        if len(candidato) == 9:
+            return "CE", candidato, f"tipo_doc:{origen}:len9"
+
+    compacto = digits.strip("0")
+    if len(compacto) >= 9:
+        return "CE", compacto[-9:], "tipo_doc:fallback_ultimos_9"
+    if len(compacto) >= 8:
+        return "DNI", compacto[-8:], "tipo_doc:fallback_ultimos_8"
+    if len(digits) >= 9:
+        return "CE", digits[-9:], "tipo_doc:fallback_raw_ultimos_9"
+    if len(digits) >= 8:
+        return "DNI", digits[-8:], "tipo_doc:fallback_raw_ultimos_8"
+
+    return "DNI", digits, "tipo_doc:default_dni_longitud_invalida"
+
+
+def normalizar_copia_secuencia_pago(valor: str) -> str:
+    """Convierte valores tipo 095253-0 a 095253 conservando ceros a la izquierda."""
+    texto = str(valor or "").strip()
+    if not texto:
+        return ""
+    if "-" in texto:
+        texto = texto.split("-", 1)[0].strip()
+    return texto
+
+
 def resolver_sede_atencion_desde_departamento(departamento: str) -> tuple[str, str]:
     """Devuelve (sede, origen) a partir del departamento de la hoja base."""
     dep_norm = _normalizar_departamento(departamento)
@@ -1369,11 +1560,356 @@ def seleccionar_modalidad(page, modalidad: str) -> None:
     )
 
 
+def seleccionar_tipo_registro(page, tipo_registro: str) -> None:
+    seleccionar_opcion_primefaces(
+        page,
+        trigger_selector=SEL["crear_solicitud_tipo_registro_trigger"],
+        panel_selector=SEL["crear_solicitud_tipo_registro_panel"],
+        label_selector=SEL["crear_solicitud_tipo_registro_label"],
+        valor=tipo_registro,
+        nombre_campo="Tipo de registro",
+    )
+
+
+def seleccionar_tipo_documento(page, tipo_documento: str) -> None:
+    seleccionar_opcion_primefaces(
+        page,
+        trigger_selector=SEL["crear_solicitud_tipo_doc_trigger"],
+        panel_selector=SEL["crear_solicitud_tipo_doc_panel"],
+        label_selector=SEL["crear_solicitud_tipo_doc_label"],
+        valor=tipo_documento,
+        nombre_campo="Tipo de Documento",
+    )
+
+
+def ingresar_documento_y_buscar(page, numero_documento: str) -> None:
+    valor = "".join(ch for ch in str(numero_documento or "") if ch.isdigit())
+    if not valor:
+        raise Exception("No se pudo ingresar Documento: DNI vacío o inválido")
+
+    input_doc = page.locator(SEL["crear_solicitud_documento_input"]).first
+    input_doc.wait_for(state="visible", timeout=9000)
+    input_doc.click(timeout=5000)
+    input_doc.fill(valor)
+    input_doc.evaluate(
+        'el => { el.dispatchEvent(new Event("input", {bubbles:true})); el.dispatchEvent(new Event("change", {bubbles:true})); }'
+    )
+    input_doc.blur()
+
+    actual = str(input_doc.input_value() or "").strip()
+    if actual != valor:
+        input_doc.click(timeout=3000)
+        input_doc.press("Control+A")
+        input_doc.press("Backspace")
+        input_doc.type(valor, delay=10)
+        input_doc.evaluate(
+            'el => { el.dispatchEvent(new Event("input", {bubbles:true})); el.dispatchEvent(new Event("change", {bubbles:true})); }'
+        )
+        input_doc.blur()
+        actual = str(input_doc.input_value() or "").strip()
+        if actual != valor:
+            raise Exception(f"No se confirmó Documento. Esperado '{valor}' | Actual '{actual}'")
+
+    boton_buscar = page.locator(SEL["crear_solicitud_buscar_button"]).first
+    boton_buscar.wait_for(state="visible", timeout=9000)
+    boton_buscar.click(timeout=8000)
+    esperar_ajax_primefaces(page, timeout_ms=7000)
+
+
+def limpiar_campo_copia_secuencia_pago(page) -> None:
+    """Limpia el campo de Copia de Secuencia de pago."""
+    input_sec = page.locator(SEL["crear_solicitud_nro_secuencia_input"]).first
+    try:
+        input_sec.wait_for(state="visible", timeout=3000)
+        input_sec.click(timeout=2000)
+        input_sec.press("Control+A")
+        input_sec.press("Backspace")
+        input_sec.evaluate(
+            'el => { el.dispatchEvent(new Event("input", {bubbles:true})); el.dispatchEvent(new Event("change", {bubbles:true})); }'
+        )
+        input_sec.blur()
+    except Exception:
+        pass
+
+
+def ingresar_copia_secuencia_pago(page, valor_secuencia: str) -> None:
+    valor = str(valor_secuencia or "").strip()
+    if not valor:
+        raise Exception("La Copia de Secuencia de pago está vacía")
+
+    input_sec = page.locator(SEL["crear_solicitud_nro_secuencia_input"]).first
+    input_sec.wait_for(state="visible", timeout=9000)
+    input_sec.click(timeout=5000)
+    input_sec.fill(valor)
+    input_sec.evaluate(
+        'el => { el.dispatchEvent(new Event("input", {bubbles:true})); el.dispatchEvent(new Event("change", {bubbles:true})); }'
+    )
+    input_sec.blur()
+
+    actual = str(input_sec.input_value() or "").strip()
+    if actual != valor:
+        input_sec.click(timeout=3000)
+        input_sec.press("Control+A")
+        input_sec.press("Backspace")
+        input_sec.type(valor, delay=10)
+        input_sec.evaluate(
+            'el => { el.dispatchEvent(new Event("input", {bubbles:true})); el.dispatchEvent(new Event("change", {bubbles:true})); }'
+        )
+        input_sec.blur()
+        actual = str(input_sec.input_value() or "").strip()
+        if actual != valor:
+            raise Exception(f"No se confirmó Copia de Secuencia de pago. Esperado '{valor}' | Actual '{actual}'")
+
+    boton_verificar = page.locator(SEL["crear_solicitud_verificar_recibo_button"]).first
+    boton_verificar.wait_for(state="visible", timeout=9000)
+    boton_verificar.click(timeout=8000)
+    esperar_ajax_primefaces(page, timeout_ms=7000)
+
+
+def _script_monitor_carnet_growl_js() -> str:
+    """
+    Script JS que instala un MutationObserver para capturar mensajes growl en tiempo real.
+    Mantiene un buffer persistente (window.__carnetGrowlBuffer) independiente del DOM.
+    Esto permite detectar mensajes aunque desaparezcan y sin necesidad de navegador visible.
+    """
+    return """
+    (() => {
+        if (window.__carnetGrowlInstalled) return;
+        window.__carnetGrowlInstalled = true;
+        window.__carnetGrowlBuffer = window.__carnetGrowlBuffer || [];
+
+        const pushMessage = (text) => {
+            if (!text) return;
+            const t = String(text).trim();
+            if (!t) return;
+            window.__carnetGrowlBuffer.push({ text: t, ts: Date.now() });
+            if (window.__carnetGrowlBuffer.length > 160) {
+                window.__carnetGrowlBuffer = window.__carnetGrowlBuffer.slice(-160);
+            }
+        };
+
+        const extractFromNode = (node) => {
+            if (!node) return;
+            const selectors = '#mensajesGrowl_container .ui-growl-title, #mensajesGrowl_container .ui-growl-message, .ui-growl-title, .ui-growl-message';
+
+            if (typeof node.matches === 'function' && node.matches(selectors)) {
+                pushMessage(node.textContent || '');
+            }
+
+            if (typeof node.querySelectorAll === 'function') {
+                const nodes = Array.from(node.querySelectorAll(selectors));
+                for (const n of nodes) {
+                    pushMessage(n.textContent || '');
+                }
+            }
+        };
+
+        const observer = new MutationObserver((mutations) => {
+            for (const m of mutations) {
+                for (const n of m.addedNodes || []) {
+                    extractFromNode(n);
+                }
+                if (m.type === 'characterData' && m.target) {
+                    pushMessage(m.target.textContent || '');
+                }
+            }
+        });
+
+        if (document && document.body) {
+            observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+            extractFromNode(document.body);
+        }
+    })();
+    """
+
+
+def activar_monitor_carnet_growl(page) -> None:
+    """
+    Instala el monitor de growl en la página.
+    Se ejecuta en background, sin necesidad de navegador visible.
+    """
+    try:
+        monitor_script = _script_monitor_carnet_growl_js()
+        page.add_init_script(script=monitor_script)
+        page.evaluate(monitor_script)
+    except Exception:
+        pass
+
+
+def obtener_buffer_carnet_growl(page) -> list:
+    """
+    Recupera el buffer de mensajes capturados por el monitor.
+    Retorna lista de dicts {text, ts} de todos los mensajes vistos.
+    """
+    try:
+        buffer = page.evaluate("() => window.__carnetGrowlBuffer || []")
+        return buffer if isinstance(buffer, list) else []
+    except Exception:
+        return []
+
+
+def detectar_mensaje_carne_cesado(page, max_wait_ms: int = 5000) -> tuple[bool, str]:
+    """
+    Detecta si hay un mensaje de carné cesado post-Buscar con POLLING ACTIVO.
+    
+    Estrategia multinivel:
+    1. Buffer JS persistente (captura mensajes aunque desaparezcan del DOM)
+    2. DOM actual (múltiples selectores)
+    3. HTML page.content() (busca texto en HTML oculto)
+    
+    Retorna (encontrado, texto_mensaje).
+    Realiza polling hasta vencer deadline o encontrar el mensaje.
+    """
+    deadline = time.time() + (max(0, int(max_wait_ms)) / 1000.0)
+    
+    while True:
+        mensajes = []
+        
+        # 1. Buffer JS (persistente, aunque el DOM esté vacío)
+        try:
+            buffer = obtener_buffer_carnet_growl(page)
+            for msg_obj in buffer:
+                texto = str(msg_obj.get("text", "")) if isinstance(msg_obj, dict) else str(msg_obj)
+                texto = texto.strip()
+                if texto:
+                    mensajes.append(texto)
+        except Exception:
+            pass
+        
+        # 2. DOM actual: múltiples selectores para cobertura completa
+        for selector in [
+            ".ui-growl-item .ui-growl-title",
+            ".ui-growl-item .ui-growl-message",
+            ".ui-growl-message",
+            ".ui-growl-message-error",
+            "#mensajesGrowl_container .ui-growl-title",
+            "#mensajesGrowl_container .ui-growl-message",
+        ]:
+            try:
+                loc = page.locator(selector)
+                total = min(loc.count(), 6)
+                for i in range(total):
+                    txt = (loc.nth(i).text_content() or "").strip()
+                    if txt:
+                        mensajes.append(txt)
+            except Exception:
+                pass
+        
+        # 3. Fallback: buscar en HTML del documento (incluye nodos ocultos)
+        try:
+            html_doc = (page.content() or "").lower()
+            if "carne" in html_doc and "cesado" in html_doc:
+                return True, "Mensaje de carné cesado detectado en HTML de página"
+        except Exception:
+            pass
+        
+        # Evaluar todos los mensajes capturados
+        for msg in mensajes:
+            msg_low = msg.lower()
+            if "carne" in msg_low and "cesado" in msg_low:
+                return True, msg
+        
+        # Chequear si venció el deadline
+        if time.time() >= deadline:
+            return False, ""
+        
+        # Polling suave: esperar 120ms antes de reintentar
+        page.wait_for_timeout(120)
+
+
+def reintentar_busqueda_con_cambio_empresa(page, logger: logging.Logger, dni: str) -> None:
+    """
+    Sub-validación: si se detectó carné cesado, cambia a CAMBIO DE EMPRESA y rebusca.
+    Usa polling activo con deadline (5 segundos) para capturar mensajes confiablemente.
+    """
+    # Asegurar que el monitor está activo (monitorea en background)
+    activar_monitor_carnet_growl(page)
+    
+    # Polling activo con deadline de 5 segundos (cubre tiempo de AJAX + renderizado)
+    logger.info("[SUB-VALIDACION] Iniciando búsqueda con polling activo (5 seg) para detectar carné cesado...")
+    encontrado, msg = detectar_mensaje_carne_cesado(page, max_wait_ms=5000)
+    
+    if not encontrado:
+        logger.info("[SUB-VALIDACION] No hay mensaje de carné cesado. Búsqueda válida con tipo INICIAL.")
+        return
+
+    logger.warning(
+        "[SUB-VALIDACION] *** DETECTADO carné cesado: %s",
+        msg,
+    )
+    logger.info("[SUB-VALIDACION] Cambiando Tipo de Registro a CAMBIO DE EMPRESA...")
+    seleccionar_tipo_registro(page, "CAMBIO DE EMPRESA")
+    logger.info("[SUB-VALIDACION] Tipo de Registro cambiado a CAMBIO DE EMPRESA")
+
+    dni_limpio = "".join(ch for ch in str(dni or "") if ch.isdigit())
+    logger.info("[SUB-VALIDACION] Reintentando Buscar con DNI=%s tipo CAMBIO DE EMPRESA", dni_limpio)
+    ingresar_documento_y_buscar(page, dni_limpio)
+    logger.info("[SUB-VALIDACION] Búsqueda reintentada con CAMBIO DE EMPRESA")
+
+
+def detectar_resultado_verificacion_comprobante(page, max_wait_ms: int = 5000) -> tuple[str, str]:
+    """
+    Detecta el resultado de click al botón Verificar (Comprobante).
+    
+    Retorna:
+    - ("ENCONTRADO", "Recibo encontrado") → Éxito, continuar
+    - ("NO_ENCONTRADO", "No se encontró el recibo") → Error, fallback
+    - ("TIMEOUT", "") → No se detectó nada en tiempo límite
+    
+    Usa polling activo con estrategia multinivel (Buffer JS + DOM + HTML).
+    """
+    deadline = time.time() + (max(0, int(max_wait_ms)) / 1000.0)
+    
+    while True:
+        if time.time() >= deadline:
+            return "TIMEOUT", ""
+        
+        # 1. Buffer JS
+        try:
+            buffer = obtener_buffer_carnet_growl(page) or []
+            for msg_dict in buffer:
+                msg_text = str(msg_dict.get("text", "") or "").lower()
+                if "recibo encontrado" in msg_text:
+                    return "ENCONTRADO", "Recibo encontrado"
+                if "no se encontró" in msg_text and "recibo" in msg_text:
+                    return "NO_ENCONTRADO", "No se encontró el recibo"
+        except Exception:
+            pass
+        
+        # 2. DOM actual
+        try:
+            growl_items = page.locator(".ui-growl-item").all()
+            for item in growl_items:
+                title_text = (item.locator(".ui-growl-title").inner_text() or "").lower()
+                if "recibo encontrado" in title_text:
+                    return "ENCONTRADO", "Recibo encontrado"
+                if "no se encontró" in title_text:
+                    return "NO_ENCONTRADO", "No se encontró el recibo"
+        except Exception:
+            pass
+        
+        # 3. HTML de página
+        try:
+            html = (page.content() or "").lower()
+            if "recibo encontrado" in html:
+                return "ENCONTRADO", "Recibo encontrado"
+            if "no se encontró" in html and "recibo" in html:
+                return "NO_ENCONTRADO", "No se encontró el recibo"
+        except Exception:
+            pass
+        
+        time.sleep(0.1)
+
+
 def procesar_registro_cruce_en_formulario(page, logger: logging.Logger, item: dict) -> bool:
     """Aplica la sede de atención y actualiza la fila de comparación para un registro individual."""
+    # Activar monitor de growl al inicio para capturar mensajes en background
+    if page is not None:
+        activar_monitor_carnet_growl(page)
+    
     compare_url = str(item.get("compare_url", "") or "").strip()
     compare_row_number = int(item.get("compare_row_number", 0) or 0)
-    compare_fieldnames = item.get("compare_fieldnames", []) or []
+    compare_fieldnames = item.get("fieldnames_compare", item.get("compare_fieldnames", [])) or []
     fecha_hoy = str(item.get("fecha_tramite", "") or datetime.now().strftime("%d/%m/%Y")).strip()
     base_row = item.get("base_row")
     dni = str(item.get("dni", "") or "").strip()
@@ -1432,18 +1968,150 @@ def procesar_registro_cruce_en_formulario(page, logger: logging.Logger, item: di
     seleccionar_modalidad(page, modalidad_aplicada)
     logger.info("[FORM] Modalidad aplicada en la vista: %s", modalidad_aplicada)
 
-    if compare_url and compare_row_number > 0:
-        _actualizar_fila_comparacion_por_row(
-            logger,
-            compare_url,
-            compare_row_number,
-            {
-                "observacion": "",
-                "fecha tramite": fecha_hoy,
-            },
-            fieldnames=compare_fieldnames,
-        )
+    # Validar tipo de registro sin forzar CAMBIO; el ajuste a CAMBIO se hace
+    # solo cuando la sub-validacion detecta carné cesado tras Buscar.
+    try:
+        tipo_reg_label = page.locator(SEL["crear_solicitud_tipo_registro_label"]).first
+        tipo_reg_text = (tipo_reg_label.inner_text() or "").strip()
+        logger.info("[FORM] Tipo de Registro preseleccionado: %s", tipo_reg_text)
+        tipo_reg_norm = _normalizar_columna(tipo_reg_text)
+        if not tipo_reg_text or "seleccione" in tipo_reg_norm or tipo_reg_text == "---":
+            logger.info("[FORM] Tipo de Registro no esta seleccionado; seleccionando INICIAL...")
+            seleccionar_tipo_registro(page, "INICIAL")
+            page.wait_for_timeout(300)
+            tipo_reg_text = (page.locator(SEL["crear_solicitud_tipo_registro_label"]).first.inner_text() or "").strip()
+            logger.info("[FORM] Tipo de Registro despues: %s", tipo_reg_text)
+        elif tipo_reg_norm not in {"inicial", "cambio de empresa"}:
+            logger.info("[FORM] Tipo de Registro fuera de objetivo (%s); ajustando a INICIAL", tipo_reg_text)
+            seleccionar_tipo_registro(page, "INICIAL")
+            page.wait_for_timeout(300)
+            tipo_reg_text = (page.locator(SEL["crear_solicitud_tipo_registro_label"]).first.inner_text() or "").strip()
+            logger.info("[FORM] Tipo de Registro despues de ajuste: %s", tipo_reg_text)
+    except Exception as exc:
+        logger.warning("[FORM] Error validando Tipo de Registro: %s", exc)
 
+    tipo_doc_objetivo = str(item.get("tipo_doc_objetivo", "") or "").strip()
+    dni_normalizado_tipo_doc = str(item.get("dni_normalizado_tipo_doc", "") or "").strip()
+    tipo_doc_origen = str(item.get("tipo_doc_origen", "") or "").strip()
+    if not tipo_doc_objetivo:
+        tipo_doc_objetivo, dni_normalizado_tipo_doc, tipo_doc_origen = resolver_tipo_documento_desde_dni(dni)
+    logger.info(
+        "[FORM] DNI_RAW=%s | DNI_NORMALIZADO=%s | TIPO_DOC_OBJETIVO=%s | TIPO_DOC_ORIGEN=%s",
+        dni,
+        dni_normalizado_tipo_doc,
+        tipo_doc_objetivo,
+        tipo_doc_origen,
+    )
+    seleccionar_tipo_documento(page, tipo_doc_objetivo)
+    logger.info("[FORM] Tipo de Documento aplicado en la vista: %s", tipo_doc_objetivo)
+
+    # Restaurar flujo base: primero Documento + Buscar.
+    dni_limpio = "".join(ch for ch in (dni or "") if ch.isdigit())
+    logger.info("[FORM] Procediendo con búsqueda de documento...")
+    logger.info("[FORM] Ingresando DNI: %s", dni_limpio)
+    ingresar_documento_y_buscar(page, dni_limpio)
+    logger.info("[FORM] Búsqueda de documento ejecutada")
+
+    # Si aparece carné cesado, esta rutina cambia a CAMBIO DE EMPRESA y reintenta Buscar.
+    reintentar_busqueda_con_cambio_empresa(page, logger, dni_limpio)
+
+    # Loop de secuencias con fallback por "No se encontró el recibo".
+    secuencia_candidatos = item.get("terceros_libres", []) or []  # Usar terceros_libres del item
+    tercera_url = str(item.get("tercera_url", "") or os.getenv("CARNET_GSHEET_THIRD_URL", DEFAULT_GSHEET_THIRD_URL) or "").strip()
+    third_fieldnames = item.get("fieldnames_third", []) or []
+    col_third_estado = item.get("col_third_estado_sec")
+    
+    # Si no hay candidatos, crear fallback con la secuencia actual del item
+    if not secuencia_candidatos:
+        nro_sec = str(item.get("nro_secuencia_objetivo", "") or item.get("copia_secuencia_pago", "") or "").strip()
+        if nro_sec:
+            secuencia_candidatos = [{
+                "copia_secuencia_pago": nro_sec,
+                "copia_secuencia_pago_raw": str(item.get("copia_secuencia_pago_raw", "") or "").strip(),
+                "row_number": item.get("tercera_row_number", 0),
+            }]
+        else:
+            logger.error("[FORM] Sin secuencia de comprobante disponible")
+            return False
+    
+    secuencia_exitosa = False
+    for intento_num, candidato in enumerate(secuencia_candidatos, 1):
+        nro_sec = str(candidato.get("copia_secuencia_pago", "") or "").strip()
+        nro_sec_raw = str(candidato.get("copia_secuencia_pago_raw", "") or "").strip()
+        tercera_row = int(candidato.get("row_number", 0) or 0)
+        
+        if not nro_sec:
+            logger.warning("[FORM] Candidato %s sin secuencia; saltando", intento_num)
+            continue
+        
+        logger.info("[FORM] Intento secuencia %s/%s: %s", intento_num, len(secuencia_candidatos), nro_sec)
+        ingresar_copia_secuencia_pago(page, nro_sec)
+        
+        # Esperar AJAX y detectar resultado (AMBOS mensajes)
+        page.wait_for_timeout(800)
+        resultado, msg = detectar_resultado_verificacion_comprobante(page, max_wait_ms=6000)
+        
+        if resultado == "ENCONTRADO":
+            logger.info("[FORM] [OK] SECUENCIA %s VALIDA EN SUCAMEC", nro_sec)
+            secuencia_exitosa = True
+            item["copia_secuencia_pago"] = nro_sec
+            item["copia_secuencia_pago_raw"] = nro_sec_raw
+            item["tercera_row_number"] = tercera_row
+            break
+        elif resultado == "NO_ENCONTRADO":
+            logger.warning("[FORM] [ERROR] SECUENCIA %s NO ENCONTRADA EN SUCAMEC", nro_sec)
+            # Marcar en tercera hoja si existe
+            if tercera_url and tercera_row > 0:
+                try:
+                    if col_third_estado:
+                        _actualizar_fila_tercera_hoja_por_row(logger, tercera_url, tercera_row,
+                            {col_third_estado: "NO ENCONTRADO"}, third_fieldnames)
+                        logger.info("[FORM] Fila %s marcada como NO ENCONTRADO en tercera hoja", tercera_row)
+                    else:
+                        logger.warning("[FORM] Columna 'Estado Secuencia de Pago' no resuelta; no se marca fila tercera=%s", tercera_row)
+                except Exception as exc:
+                    logger.warning("[FORM] No se pudo marcar en tercera hoja: %s", exc)
+            # Limpiar campo para siguiente intento
+            try:
+                limpiar_campo_copia_secuencia_pago(page)
+            except Exception:
+                pass
+        else:  # TIMEOUT
+            logger.info("[FORM] [WARN] TIMEOUT en deteccion; asumiendo EXITO para %s", nro_sec)
+            secuencia_exitosa = True
+            item["copia_secuencia_pago"] = nro_sec
+            item["copia_secuencia_pago_raw"] = nro_sec_raw
+            item["tercera_row_number"] = tercera_row
+            break
+    
+    if not secuencia_exitosa:
+        logger.error("[FORM] [FRACASO] Sin secuencia valida tras %s intentos", len(secuencia_candidatos))
+        # Si solo hay 1 candidato (fallback), continua igualmente para testing
+        # Si hay múltiples y todos fallan, retorna error
+        if len(secuencia_candidatos) > 1:
+            if compare_url and compare_row_number > 0:
+                try:
+                    _actualizar_fila_comparacion_por_row(logger, compare_url, compare_row_number,
+                        {"observacion": f"Sin secuencia valida tras {len(secuencia_candidatos)} intentos", "fecha_tramite": fecha_hoy},
+                        fieldnames=compare_fieldnames,
+                    )
+                except:
+                    pass
+            return False
+        else:
+            logger.warning("[FORM] [WARN] Unica secuencia fallo pero continuando para testing...")
+
+    # Actualizar hoja de comparación
+    if compare_url and compare_row_number > 0:
+        try:
+            _actualizar_fila_comparacion_por_row(logger, compare_url, compare_row_number,
+                {"observacion": "", "fecha_tramite": fecha_hoy},
+                fieldnames=compare_fieldnames,
+            )
+        except:
+            pass
+
+    logger.info("[FORM] [OK] REGISTRO COMPLETADO EXITOSAMENTE")
     return True
 
 
@@ -2035,6 +2703,8 @@ def _ejecutar_flujo_fila_por_fila(logger: logging.Logger, max_rows: int = 1) -> 
         logger.warning("[CRUCE] No hay registros pendientes para procesar uno por uno")
         return 0
 
+    max_login_retries_per_group = max(1, _safe_int_env("MAX_LOGIN_RETRIES_PER_GROUP", 12))
+
     playwright = sync_playwright().start()
     try:
         hold_final = _as_bool_env("CARNET_HOLD_BROWSER_ON_FINISH", default=True)
@@ -2051,7 +2721,7 @@ def _ejecutar_flujo_fila_por_fila(logger: logging.Logger, max_rows: int = 1) -> 
                 grupo = "JV"
 
             logger.info(
-                "[FILA %s] DNI=%s | GRUPO=%s | DEPARTAMENTO=%s | PUESTO=%s | SEDE=%s | MODALIDAD_OBJETIVO=%s | ORIGEN=%s | CRUCE_BASE_FILA=%s",
+                "[FILA %s] DNI=%s | GRUPO=%s | DEPARTAMENTO=%s | PUESTO=%s | SEDE=%s | MODALIDAD_OBJETIVO=%s | TIPO_DOC_OBJETIVO=%s | ORIGEN=%s | CRUCE_BASE_FILA=%s",
                 idx,
                 item.get("dni", ""),
                 grupo,
@@ -2059,19 +2729,63 @@ def _ejecutar_flujo_fila_por_fila(logger: logging.Logger, max_rows: int = 1) -> 
                 item.get("puesto", ""),
                 item.get("sede", ""),
                 item.get("modalidad_objetivo", ""),
+                item.get("tipo_doc_objetivo", ""),
                 item.get("origen_sede", ""),
                 item.get("base_row_number", 0),
             )
             mantener_abierto_en_esta_fila = bool(
                 hold_final and idx == len(pendientes) and (not _is_scheduled_mode())
             )
-            ejecutar_login_grupo(
-                playwright,
-                logger,
-                grupo,
-                registro_formulario=item,
-                keep_browser_open_on_finish=mantener_abierto_en_esta_fila,
-            )
+
+            intento = 0
+            while intento < max_login_retries_per_group:
+                intento += 1
+                logger.info(
+                    "[FILA %s][%s] Intento login %s/%s",
+                    idx,
+                    grupo,
+                    intento,
+                    max_login_retries_per_group,
+                )
+                try:
+                    ejecutar_login_grupo(
+                        playwright,
+                        logger,
+                        grupo,
+                        registro_formulario=item,
+                        keep_browser_open_on_finish=mantener_abierto_en_esta_fila,
+                    )
+                    break
+                except PlaywrightTimeoutError as exc:
+                    logger.warning(
+                        "[FILA %s][%s] Timeout en intento %s: %s",
+                        idx,
+                        grupo,
+                        intento,
+                        exc,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[FILA %s][%s] Error en intento %s: %s",
+                        idx,
+                        grupo,
+                        intento,
+                        exc,
+                    )
+
+                if intento >= max_login_retries_per_group:
+                    raise Exception(
+                        f"[FILA {idx}][{grupo}] No se pudo completar login tras {max_login_retries_per_group} intentos"
+                    )
+
+                espera_backoff = min(8, 1 + intento)
+                logger.info(
+                    "[FILA %s][%s] Reintentando login en %ss...",
+                    idx,
+                    grupo,
+                    espera_backoff,
+                )
+                time.sleep(espera_backoff)
         return 0
     finally:
         try:
@@ -2119,6 +2833,7 @@ def ejecutar_flujo_secundario() -> int:
                     ("ruc", ["ruc"]),
                     ("solicitado_por", ["solicitado por", "solicitado_por"]),
                     ("copia_secuencia_pago", ["copia de secuencia de pago", "copia secuencia de pago", "secuencia de pago"]),
+                    ("estado_secuencia_pago", ["estado secuencia de pago", "estado secuencia pago", "estado_secuencia_pago", "estado secuencia"]),
                     ("dni", ["dni"]),
                     ("apellidos_y_nombre", ["apellidos y nombre", "apellidos y nombres", "apellido y nombre", "nombres y apellidos"]),
                 ]
