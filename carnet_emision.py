@@ -972,6 +972,128 @@ def _estado_comparacion_es_objetivo(estado: str, estados_objetivo: set[str], per
     return valor in estados_objetivo
 
 
+def _parse_fecha_texto(valor: str) -> datetime | None:
+    texto = str(valor or "").strip()
+    if not texto:
+        return None
+
+    candidatos = [
+        "%d/%m/%Y",
+        "%d-%m-%Y",
+        "%Y-%m-%d",
+        "%d/%m/%y",
+        "%d-%m-%y",
+        "%Y/%m/%d",
+        "%d.%m.%Y",
+        "%d %m %Y",
+    ]
+    for formato in candidatos:
+        try:
+            return datetime.strptime(texto, formato)
+        except Exception:
+            pass
+
+    match = re.search(r"(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})", texto)
+    if match:
+        dia, mes, anio = match.groups()
+        anio_int = int(anio)
+        if anio_int < 100:
+            anio_int += 2000 if anio_int < 70 else 1900
+        try:
+            return datetime(int(anio_int), int(mes), int(dia))
+        except Exception:
+            return None
+
+    return None
+
+
+def _resolver_fecha_cercana_en_fila(row: dict, fieldnames: list[str]) -> datetime | None:
+    candidatos_fecha = [
+        "fecha",
+        "fecha_programacion",
+        "fecha programacion",
+        "fecha_programada",
+        "fecha programada",
+        "fecha_tramite",
+        "fecha tramite",
+        "fecha trámite",
+        "fecha_registro",
+        "fecha registro",
+        "fecha_cita",
+        "fecha cita",
+        "fecha_emision",
+        "fecha emision",
+        "fecha de registro",
+        "fecha de programacion",
+    ]
+
+    for col in fieldnames:
+        col_norm = _normalizar_columna(col)
+        if "fecha" not in col_norm:
+            continue
+        for candidato in candidatos_fecha:
+            if _normalizar_columna(candidato) == col_norm or _normalizar_columna(candidato) in col_norm:
+                fecha = _parse_fecha_texto(str(row.get(col, "") or ""))
+                if fecha:
+                    return fecha
+
+    for col in fieldnames:
+        if "fecha" in _normalizar_columna(col):
+            fecha = _parse_fecha_texto(str(row.get(col, "") or ""))
+            if fecha:
+                return fecha
+
+    return None
+
+
+def _seleccionar_fila_base_por_dni(rows_base: list[dict], fields_base: list[str], col_base_dni: str, dni: str, logger: logging.Logger) -> dict | None:
+    candidatos = []
+    for base_idx, row in enumerate(rows_base, start=2):
+        dni_base = str(row.get(col_base_dni, "") or "").strip()
+        if dni_base != dni:
+            continue
+        candidatos.append((base_idx, row))
+
+    if not candidatos:
+        return None
+
+    if len(candidatos) == 1:
+        base_idx, row = candidatos[0]
+        return {
+            "row": row,
+            "row_number": base_idx,
+            "fecha_cercana": None,
+            "criterio_seleccion": "unica_coincidencia",
+        }
+
+    hoy = datetime.now()
+    mejor = None
+    mejor_delta = None
+    for base_idx, row in candidatos:
+        fecha_candidata = _resolver_fecha_cercana_en_fila(row, fields_base)
+        delta = abs((hoy - fecha_candidata).total_seconds()) if fecha_candidata else float("inf")
+        if mejor is None or delta < mejor_delta or (delta == mejor_delta and base_idx < int(mejor.get("row_number", base_idx))):
+            mejor = {
+                "row": row,
+                "row_number": base_idx,
+                "fecha_cercana": fecha_candidata,
+                "criterio_seleccion": "fecha_mas_cercana",
+            }
+            mejor_delta = delta
+
+    if mejor is None:
+        return None
+
+    logger.info(
+        "[CRUCE][BASE] DNI=%s con %s coincidencias | seleccionada_fila=%s | fecha=%s",
+        dni,
+        len(candidatos),
+        mejor.get("row_number", 0),
+        mejor.get("fecha_cercana").strftime("%d/%m/%Y") if mejor.get("fecha_cercana") else "N/D",
+    )
+    return mejor
+
+
 def _cargar_cruce_pendiente_desde_hojas(logger: logging.Logger, max_rows: int = 1) -> list[dict]:
     url_base = str(os.getenv("CARNET_GSHEET_URL", DEFAULT_GSHEET_URL) or DEFAULT_GSHEET_URL).strip()
     url_compare = str(os.getenv("CARNET_GSHEET_COMPARE_URL", DEFAULT_GSHEET_COMPARE_URL) or "").strip()
@@ -1062,15 +1184,6 @@ def _cargar_cruce_pendiente_desde_hojas(logger: logging.Logger, max_rows: int = 
         permitir_estado_vacio,
     )
 
-    base_por_dni = {}
-    for base_idx, row in enumerate(rows_base, start=2):
-        dni = str(row.get(col_base_dni, "") or "").strip()
-        if dni and dni not in base_por_dni:
-            base_por_dni[dni] = {
-                "row": row,
-                "row_number": base_idx,
-            }
-
     pendientes = []
     registros_saltados_sin_dni = 0
     registros_saltados_estado_fuera_criterio = 0
@@ -1089,9 +1202,11 @@ def _cargar_cruce_pendiente_desde_hojas(logger: logging.Logger, max_rows: int = 
             logger.debug("[CRUCE] Fila %s saltada: DNI=%s tiene ESTADO='%s' (fuera de criterio)", idx, dni, estado)
             continue
         
-        base_match = base_por_dni.get(dni)
+        base_match = _seleccionar_fila_base_por_dni(rows_base, fields_base, col_base_dni, dni, logger)
         base_row = base_match.get("row") if base_match else None
         base_row_number = int(base_match.get("row_number", 0) or 0) if base_match else 0
+        base_fecha_cercana = base_match.get("fecha_cercana") if base_match else None
+        base_criterio_seleccion = str(base_match.get("criterio_seleccion", "") or "") if base_match else ""
         departamento = str(base_row.get(col_base_departamento, "") or "").strip() if base_row else ""
         puesto = str(base_row.get(col_base_puesto, "") or "").strip() if (base_row and col_base_puesto) else ""
         sede, origen_sede = resolver_sede_atencion_desde_departamento(departamento)
@@ -1109,11 +1224,13 @@ def _cargar_cruce_pendiente_desde_hojas(logger: logging.Logger, max_rows: int = 
 
         if base_row:
             logger.info(
-                "[CRUCE][OK] COMP_FILA=%s | DNI=%s | BASE_FILA=%s | BASE_TOTAL=%s | DEPARTAMENTO=%s | PUESTO=%s | MODALIDAD_OBJETIVO=%s | TIPO_DOC_OBJETIVO=%s | DNI_NORMALIZADO=%s | COPIA_SEC_PAGO_RAW=%s | COPIA_SEC_PAGO_APLICADA=%s | ESTADO_SECUENCIA_PAGO=%s | NRO_SEC_ORIGEN=%s | TERCERA_FILA=%s",
+                "[CRUCE][OK] COMP_FILA=%s | DNI=%s | BASE_FILA=%s | BASE_TOTAL=%s | BASE_FECHA=%s | BASE_CRITERIO=%s | DEPARTAMENTO=%s | PUESTO=%s | MODALIDAD_OBJETIVO=%s | TIPO_DOC_OBJETIVO=%s | DNI_NORMALIZADO=%s | COPIA_SEC_PAGO_RAW=%s | COPIA_SEC_PAGO_APLICADA=%s | ESTADO_SECUENCIA_PAGO=%s | NRO_SEC_ORIGEN=%s | TERCERA_FILA=%s",
                 idx,
                 dni,
                 base_row_number,
                 len(rows_base),
+                base_fecha_cercana.strftime("%d/%m/%Y") if base_fecha_cercana else "N/D",
+                base_criterio_seleccion or "sin_criterio",
                 departamento,
                 puesto,
                 modalidad_objetivo,
@@ -1140,6 +1257,8 @@ def _cargar_cruce_pendiente_desde_hojas(logger: logging.Logger, max_rows: int = 
                 "estado": estado,
                 "base_row": base_row,
                 "base_row_number": base_row_number,
+                "base_fecha_cercana": base_fecha_cercana.strftime("%d/%m/%Y") if base_fecha_cercana else "",
+                "base_criterio_seleccion": base_criterio_seleccion,
                 "departamento": departamento,
                 "puesto": puesto,
                 "sede": sede,
