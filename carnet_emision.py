@@ -1253,6 +1253,8 @@ def _cargar_cruce_pendiente_desde_hojas(logger: logging.Logger, max_rows: int = 
         pendientes.append(
             {
                 "row_number": idx,
+                "compare_row_number": idx,
+                "compare_url": url_compare,
                 "dni": dni,
                 "estado": estado,
                 "base_row": base_row,
@@ -1969,6 +1971,217 @@ def detectar_mensaje_carne_cesado(page, max_wait_ms: int = 5000) -> tuple[bool, 
         
         # Polling suave: esperar 120ms antes de reintentar
         page.wait_for_timeout(120)
+        
+def detectar_error_tramite_observado(page, max_wait_ms: int = 4500, min_ts_ms: int | None = None) -> tuple[bool, str]:
+    """
+    Detecta alerta de SUCAMEC cuando el personal ya tiene registro en
+    la misma modalidad en estado OBSERVADO.
+    """
+    deadline = time.time() + (max(0, int(max_wait_ms)) / 1000.0)
+
+    def _es_mensaje_objetivo(texto: str) -> bool:
+        t = _normalizar_columna(texto)
+        if not t:
+            return False
+        return (
+            "misma modalidad" in t
+            and "estado observado" in t
+            and "personal de seguridad" in t
+        )
+
+    while True:
+        # 1. Buffer JS
+        try:
+            buffer = obtener_buffer_carnet_growl(page) or []
+            for msg_dict in buffer:
+                if min_ts_ms is not None:
+                    try:
+                        ts = int(msg_dict.get("ts", 0) or 0)
+                        if ts and ts < int(min_ts_ms):
+                            continue
+                    except Exception:
+                        pass
+                texto = str(msg_dict.get("text", "") or "").strip()
+                if _es_mensaje_objetivo(texto):
+                    return True, texto
+        except Exception:
+            pass
+
+        # 2. DOM actual
+        for selector in [
+            ".ui-growl-item .ui-growl-title",
+            ".ui-growl-item .ui-growl-message",
+            "#mensajesGrowl_container .ui-growl-title",
+            "#mensajesGrowl_container .ui-growl-message",
+        ]:
+            try:
+                loc = page.locator(selector)
+                total = min(loc.count(), 8)
+                for i in range(total):
+                    texto = (loc.nth(i).text_content() or "").strip()
+                    if _es_mensaje_objetivo(texto):
+                        return True, texto
+            except Exception:
+                pass
+
+        # 3. HTML de la pagina
+        try:
+            html = (page.content() or "")
+            if _es_mensaje_objetivo(html):
+                return True, "Este personal de seguridad cuenta con un registro en la misma modalidad en estado OBSERVADO"
+        except Exception:
+            pass
+
+        if time.time() >= deadline:
+            return False, ""
+
+        page.wait_for_timeout(120)
+
+
+def detectar_error_curso_no_vigente(page, max_wait_ms: int = 4500, min_ts_ms: int | None = None) -> tuple[bool, str]:
+    """
+    Detecta alerta de SUCAMEC cuando el prospecto no cuenta con curso vigente.
+    """
+    deadline = time.time() + (max(0, int(max_wait_ms)) / 1000.0)
+
+    def _es_mensaje_objetivo(texto: str) -> bool:
+        t = _normalizar_columna(texto)
+        return "prospecto" in t and "curso vigente" in t and "no cuenta" in t
+
+    while True:
+        try:
+            buffer = obtener_buffer_carnet_growl(page) or []
+            for msg_dict in buffer:
+                if min_ts_ms is not None:
+                    try:
+                        ts = int(msg_dict.get("ts", 0) or 0)
+                        if ts and ts < int(min_ts_ms):
+                            continue
+                    except Exception:
+                        pass
+                texto = str(msg_dict.get("text", "") or "").strip()
+                if _es_mensaje_objetivo(texto):
+                    return True, texto
+        except Exception:
+            pass
+
+        for selector in [
+            ".ui-growl-item .ui-growl-title",
+            ".ui-growl-item .ui-growl-message",
+            "#mensajesGrowl_container .ui-growl-title",
+            "#mensajesGrowl_container .ui-growl-message",
+        ]:
+            try:
+                loc = page.locator(selector)
+                total = min(loc.count(), 8)
+                for i in range(total):
+                    texto = (loc.nth(i).text_content() or "").strip()
+                    if _es_mensaje_objetivo(texto):
+                        return True, texto
+            except Exception:
+                pass
+
+        try:
+            html = (page.content() or "")
+            if _es_mensaje_objetivo(html):
+                return True, "El prospecto no cuenta con curso vigente"
+        except Exception:
+            pass
+
+        if time.time() >= deadline:
+            return False, ""
+
+        page.wait_for_timeout(120)
+
+
+def detectar_error_documento_no_existe(page, max_wait_ms: int = 4500, min_ts_ms: int | None = None) -> tuple[bool, str]:
+    """Detecta alerta de SUCAMEC: El documento ingresado no existe."""
+    deadline = time.time() + (max(0, int(max_wait_ms)) / 1000.0)
+
+    def _es_mensaje_objetivo(texto: str) -> bool:
+        t = _normalizar_columna(texto)
+        return "documento ingresado" in t and "no existe" in t
+
+    while True:
+        try:
+            buffer = obtener_buffer_carnet_growl(page) or []
+            for msg_dict in buffer:
+                if min_ts_ms is not None:
+                    try:
+                        ts = int(msg_dict.get("ts", 0) or 0)
+                        if ts and ts < int(min_ts_ms):
+                            continue
+                    except Exception:
+                        pass
+                texto = str(msg_dict.get("text", "") or "").strip()
+                if _es_mensaje_objetivo(texto):
+                    return True, texto
+        except Exception:
+            pass
+
+        for selector in [
+            ".ui-growl-item .ui-growl-title",
+            ".ui-growl-item .ui-growl-message",
+            "#mensajesGrowl_container .ui-growl-title",
+            "#mensajesGrowl_container .ui-growl-message",
+        ]:
+            try:
+                loc = page.locator(selector)
+                total = min(loc.count(), 8)
+                for i in range(total):
+                    texto = (loc.nth(i).text_content() or "").strip()
+                    if _es_mensaje_objetivo(texto):
+                        return True, texto
+            except Exception:
+                pass
+
+        try:
+            html = (page.content() or "")
+            if _es_mensaje_objetivo(html):
+                return True, "El documento ingresado no existe"
+        except Exception:
+            pass
+
+        if time.time() >= deadline:
+            return False, ""
+
+        page.wait_for_timeout(120)
+
+
+def _registrar_error_tramite_en_comparacion(
+    logger: logging.Logger,
+    compare_url: str,
+    compare_row_number: int,
+    compare_fieldnames: list[str],
+    mensaje: str,
+    fecha_tramite: str,
+) -> None:
+    """Registra OBSERVACION/ESTADO + RESPONSABLE + FECHA TRAMITE en hoja de comparación."""
+    if not compare_url or compare_row_number <= 0:
+        return
+
+    try:
+        _actualizar_fila_comparacion_por_row(
+            logger,
+            compare_url,
+            compare_row_number,
+            {
+                "observacion": mensaje,
+                "observación": mensaje,
+                "estado_tramite": "ERROR EN TRAMITE",
+                "estado tramite": "ERROR EN TRAMITE",
+                "responsable": "BOT CARNÉ SUCAMEC",
+                "fecha tramite": str(fecha_tramite or "").strip(),
+                "fecha_tramite": str(fecha_tramite or "").strip(),
+            },
+            fieldnames=compare_fieldnames,
+        )
+        logger.info(
+            "[FORM] Fila comparacion %s actualizada con OBSERVACION, ESTADO_TRAMITE, RESPONSABLE y FECHA TRAMITE",
+            compare_row_number,
+        )
+    except Exception as exc:
+        logger.warning("[FORM] No se pudo actualizar campos de error de trámite en comparación: %s", exc)
 
 
 def reintentar_busqueda_con_cambio_empresa(page, logger: logging.Logger, dni: str) -> None:
@@ -2074,8 +2287,8 @@ def procesar_registro_cruce_en_formulario(page, logger: logging.Logger, item: di
     if page is not None:
         activar_monitor_carnet_growl(page)
     
-    compare_url = str(item.get("compare_url", "") or "").strip()
-    compare_row_number = int(item.get("compare_row_number", 0) or 0)
+    compare_url = str(item.get("compare_url", "") or os.getenv("CARNET_GSHEET_COMPARE_URL", DEFAULT_GSHEET_COMPARE_URL) or "").strip()
+    compare_row_number = int(item.get("compare_row_number", 0) or item.get("row_number", 0) or 0)
     compare_fieldnames = item.get("fieldnames_compare", item.get("compare_fieldnames", [])) or []
     fecha_hoy = str(item.get("fecha_tramite", "") or datetime.now().strftime("%d/%m/%Y")).strip()
     base_row = item.get("base_row")
@@ -2176,11 +2389,79 @@ def procesar_registro_cruce_en_formulario(page, logger: logging.Logger, item: di
     dni_limpio = "".join(ch for ch in (dni or "") if ch.isdigit())
     logger.info("[FORM] Procediendo con búsqueda de documento...")
     logger.info("[FORM] Ingresando DNI: %s", dni_limpio)
+    ts_busqueda_ms = int(time.time() * 1000)
     ingresar_documento_y_buscar(page, dni_limpio)
     logger.info("[FORM] Búsqueda de documento ejecutada")
 
+    # Validacion pendiente 3/3: DNI inexistente en SUCAMEC.
+    documento_no_existe, msg_doc_no_existe = detectar_error_documento_no_existe(
+        page,
+        max_wait_ms=4500,
+        min_ts_ms=ts_busqueda_ms,
+    )
+    if documento_no_existe:
+        msg_tramite = (
+            msg_doc_no_existe.strip()
+            if str(msg_doc_no_existe or "").strip()
+            else "El documento ingresado no existe"
+        )
+        logger.warning("[FORM] [ERROR_TRAMITE] %s", msg_tramite)
+
+        _registrar_error_tramite_en_comparacion(
+            logger,
+            compare_url,
+            compare_row_number,
+            compare_fieldnames,
+            msg_tramite,
+            fecha_hoy,
+        )
+
+        return False
+
     # Si aparece carné cesado, esta rutina cambia a CAMBIO DE EMPRESA y reintenta Buscar.
     reintentar_busqueda_con_cambio_empresa(page, logger, dni_limpio)
+
+    # Validacion pendiente 1/3: registro en misma modalidad en estado OBSERVADO.
+    observado, msg_observado = detectar_error_tramite_observado(page, max_wait_ms=4500, min_ts_ms=ts_busqueda_ms)
+    if observado:
+        msg_tramite = (
+            msg_observado.strip()
+            if str(msg_observado or "").strip()
+            else "Este personal de seguridad cuenta con un registro en la misma modalidad en estado OBSERVADO"
+        )
+        logger.warning("[FORM] [ERROR_TRAMITE] %s", msg_tramite)
+
+        _registrar_error_tramite_en_comparacion(
+            logger,
+            compare_url,
+            compare_row_number,
+            compare_fieldnames,
+            msg_tramite,
+            fecha_hoy,
+        )
+
+        return False
+
+    # Validacion pendiente 2/3: prospecto sin curso SUCAMEC vigente.
+    curso_no_vigente, msg_curso = detectar_error_curso_no_vigente(page, max_wait_ms=4500, min_ts_ms=ts_busqueda_ms)
+    if curso_no_vigente:
+        msg_tramite = (
+            msg_curso.strip()
+            if str(msg_curso or "").strip()
+            else "El prospecto no cuenta con curso vigente"
+        )
+        logger.warning("[FORM] [ERROR_TRAMITE] %s", msg_tramite)
+
+        _registrar_error_tramite_en_comparacion(
+            logger,
+            compare_url,
+            compare_row_number,
+            compare_fieldnames,
+            msg_tramite,
+            fecha_hoy,
+        )
+
+        return False
 
     # Loop de secuencias con fallback por "No se encontró el recibo".
     secuencia_candidatos = item.get("terceros_libres", []) or []  # Usar terceros_libres del item
