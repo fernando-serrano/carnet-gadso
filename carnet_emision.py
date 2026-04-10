@@ -95,6 +95,12 @@ SEL = {
     "crear_solicitud_documento_input": "#createForm\\:numDoc",
     "crear_solicitud_buscar_button": "#createForm\\:btnBuscarVigilante",
     "crear_solicitud_foto_input": "#createForm\\:idFoto_input",
+    "crear_solicitud_djfut_input": "#createForm\:archivoDJ_input",
+    "crear_solicitud_djfut_label": "#createForm\:archivoDJ_label",
+    "crear_solicitud_djfut_container": "#createForm\:archivoDJ",
+    "crear_solicitud_certificado_medico_input": "#createForm\:certificadoMedico_input",
+    "crear_solicitud_certificado_medico_label": "#createForm\:certificadoMedico_label",
+    "crear_solicitud_certificado_medico_container": "#createForm\:certificadoMedico",
 }
 
 SUCCESS_SELECTORS = [
@@ -1798,15 +1804,74 @@ def ingresar_copia_secuencia_pago(page, valor_secuencia: str) -> None:
     esperar_ajax_primefaces(page, timeout_ms=7000)
 
 
+def _leer_src_preview_foto(page) -> str:
+    """Obtiene el src actual del preview de foto en el formulario, si existe."""
+    selectores = [
+        '#createForm\\:j_idt77',
+        'img[id^="createForm:"][width="150"][height="200"]',
+    ]
+    for selector in selectores:
+        try:
+            loc = page.locator(selector).first
+            if loc.count() == 0:
+                continue
+            src = str(loc.get_attribute("src", timeout=800) or "").strip()
+            if src:
+                return src
+        except Exception:
+            continue
+    return ""
+
+
+def _leer_texto_upload_djfut(page) -> str:
+    """Lee el texto visible del bloque de carga DJFUT."""
+    selectores = [
+        SEL["crear_solicitud_djfut_container"],
+        SEL["crear_solicitud_djfut_label"],
+    ]
+    for selector in selectores:
+        try:
+            loc = page.locator(selector).first
+            if loc.count() == 0:
+                continue
+            texto = str(loc.inner_text() or "").strip()
+            if texto:
+                return texto
+        except Exception:
+            continue
+    return ""
+
+
+def _leer_texto_upload_certificado_medico(page) -> str:
+    """Lee el texto visible del bloque de carga del certificado médico."""
+    selectores = [
+        SEL["crear_solicitud_certificado_medico_container"],
+        SEL["crear_solicitud_certificado_medico_label"],
+    ]
+    for selector in selectores:
+        try:
+            loc = page.locator(selector).first
+            if loc.count() == 0:
+                continue
+            texto = str(loc.inner_text() or "").strip()
+            if texto:
+                return texto
+        except Exception:
+            continue
+    return ""
+
+
 def cargar_archivo_foto_en_formulario(page, logger: logging.Logger, archivo_local: Path) -> bool:
     """Carga un archivo local en el input file de Foto sin usar el diálogo nativo de Windows."""
     ruta = Path(archivo_local)
     if not ruta.exists() or not ruta.is_file():
         raise Exception(f"No existe el archivo local para carga de foto: {ruta}")
 
+    src_antes = _leer_src_preview_foto(page)
     input_foto = page.locator(SEL["crear_solicitud_foto_input"]).first
     input_foto.wait_for(state="attached", timeout=12000)
     input_foto.set_input_files(str(ruta))
+    esperar_ajax_primefaces(page, timeout_ms=7000)
     page.wait_for_timeout(250)
 
     nombre_cargado = str(
@@ -1816,8 +1881,20 @@ def cargar_archivo_foto_en_formulario(page, logger: logging.Logger, archivo_loca
         or ""
     ).strip()
     if not nombre_cargado:
+        inicio = time.time()
+        while (time.time() - inicio) * 1000 < 4500:
+            src_despues = _leer_src_preview_foto(page)
+            if src_despues and src_despues != src_antes:
+                logger.info(
+                    "[FORM][FOTO] Carga confirmada por cambio de preview src | src_antes=%s | src_despues=%s",
+                    src_antes or "N/D",
+                    src_despues,
+                )
+                return True
+            page.wait_for_timeout(200)
+
         logger.warning(
-            "[FORM][FOTO] No se pudo confirmar por input.files; en PrimeFaces puede limpiarse tras el upload. Se continúa flujo."
+            "[FORM][FOTO] No se confirmó por input.files ni por cambio de preview src; en PrimeFaces puede limpiarse tras upload. Se continúa flujo."
         )
         return False
 
@@ -1827,6 +1904,104 @@ def cargar_archivo_foto_en_formulario(page, logger: logging.Logger, archivo_loca
         nombre_cargado,
     )
     return True
+
+
+def cargar_archivo_djfut_en_formulario(page, logger: logging.Logger, archivo_local: Path) -> bool:
+    """Carga el PDF DJFUT en el input file correspondiente y confirma por texto visible."""
+    ruta = Path(archivo_local)
+    if not ruta.exists() or not ruta.is_file():
+        raise Exception(f"No existe el archivo local para carga de DJFUT: {ruta}")
+
+    texto_antes = _leer_texto_upload_djfut(page)
+    input_djfut = page.locator(SEL["crear_solicitud_djfut_input"]).first
+    input_djfut.wait_for(state="attached", timeout=12000)
+    input_djfut.set_input_files(str(ruta))
+    esperar_ajax_primefaces(page, timeout_ms=7000)
+    page.wait_for_timeout(300)
+
+    nombre_esperado = ruta.name
+    texto_despues = _leer_texto_upload_djfut(page)
+    if nombre_esperado and nombre_esperado.lower() in texto_despues.lower():
+        logger.info(
+            "[FORM][DJFUT] Archivo cargado y confirmado por texto visible | local=%s | texto=%s",
+            ruta,
+            texto_despues,
+        )
+        return True
+
+    try:
+        nombre_input = str(
+            input_djfut.evaluate(
+                "el => (el && el.files && el.files.length > 0 && el.files[0] && el.files[0].name) ? el.files[0].name : ''"
+            )
+            or ""
+        ).strip()
+    except Exception:
+        nombre_input = ""
+
+    if nombre_input and nombre_input.lower() == nombre_esperado.lower():
+        logger.info(
+            "[FORM][DJFUT] Archivo cargado y confirmado por input.files | local=%s | nombre=%s",
+            ruta,
+            nombre_input,
+        )
+        return True
+
+    logger.warning(
+        "[FORM][DJFUT] No se pudo confirmar la carga por texto visible ni por input.files | antes=%s | despues=%s",
+        texto_antes or "N/D",
+        texto_despues or "N/D",
+    )
+    return False
+
+
+def cargar_archivo_certificado_medico_en_formulario(page, logger: logging.Logger, archivo_local: Path) -> bool:
+    """Carga el certificado médico en el input file correspondiente y confirma por nombre visible."""
+    ruta = Path(archivo_local)
+    if not ruta.exists() or not ruta.is_file():
+        raise Exception(f"No existe el archivo local para carga de certificado médico: {ruta}")
+
+    texto_antes = _leer_texto_upload_certificado_medico(page)
+    input_cert = page.locator(SEL["crear_solicitud_certificado_medico_input"]).first
+    input_cert.wait_for(state="attached", timeout=12000)
+    input_cert.set_input_files(str(ruta))
+    esperar_ajax_primefaces(page, timeout_ms=7000)
+    page.wait_for_timeout(300)
+
+    nombre_esperado = ruta.name
+    texto_despues = _leer_texto_upload_certificado_medico(page)
+    if nombre_esperado and nombre_esperado.lower() in texto_despues.lower():
+        logger.info(
+            "[FORM][CERT_MED] Archivo cargado y confirmado por texto visible | local=%s | texto=%s",
+            ruta,
+            texto_despues,
+        )
+        return True
+
+    try:
+        nombre_input = str(
+            input_cert.evaluate(
+                "el => (el && el.files && el.files.length > 0 && el.files[0] && el.files[0].name) ? el.files[0].name : ''"
+            )
+            or ""
+        ).strip()
+    except Exception:
+        nombre_input = ""
+
+    if nombre_input and nombre_input.lower() == nombre_esperado.lower():
+        logger.info(
+            "[FORM][CERT_MED] Archivo cargado y confirmado por input.files | local=%s | nombre=%s",
+            ruta,
+            nombre_input,
+        )
+        return True
+
+    logger.warning(
+        "[FORM][CERT_MED] No se pudo confirmar la carga por texto visible ni por input.files | antes=%s | despues=%s",
+        texto_antes or "N/D",
+        texto_despues or "N/D",
+    )
+    return False
 
 
 def _script_monitor_carnet_growl_js() -> str:
@@ -2496,6 +2671,26 @@ def procesar_registro_cruce_en_formulario(page, logger: logging.Logger, item: di
     item["drive_foto_local_path"] = str(foto_local_path)
     item["drive_foto_nombre"] = foto_nombre
 
+    try:
+        djfut_ok, djfut_local_path, djfut_nombre = preparar_djfut_local_desde_drive(logger, dni)
+    except Exception as exc:
+        djfut_ok, djfut_local_path, djfut_nombre = False, None, str(exc)
+
+    if not djfut_ok or djfut_local_path is None:
+        msg_djfut = f"No se pudo extraer DJFUT del expediente Drive para DNI {dni}: {djfut_nombre}"
+        _registrar_error_tramite_en_comparacion(
+            logger,
+            compare_url,
+            compare_row_number,
+            compare_fieldnames,
+            msg_djfut,
+            fecha_hoy,
+        )
+        return False
+
+    item["drive_djfut_local_path"] = str(djfut_local_path)
+    item["drive_djfut_nombre"] = djfut_nombre
+
     sede_sugerida = str(item.get("sede", "") or "").strip() or "LIMA"
     sede = sede_sugerida
     origen_dropdown = "no_verificado_dropdown"
@@ -2707,6 +2902,92 @@ def procesar_registro_cruce_en_formulario(page, logger: logging.Logger, item: di
                 dni,
                 exc,
             )
+
+    djfut_local_path = str(item.get("drive_djfut_local_path", "") or "").strip()
+    if not djfut_local_path:
+        logger.warning("[FORM][DJFUT] No se preparó archivo local DJFUT para DNI %s", dni)
+        msg_djfut = f"No se preparó archivo local DJFUT para DNI {dni}"
+        _registrar_error_tramite_en_comparacion(
+            logger,
+            compare_url,
+            compare_row_number,
+            compare_fieldnames,
+            msg_djfut,
+            fecha_hoy,
+        )
+        return False
+
+    try:
+        djfut_confirmado = cargar_archivo_djfut_en_formulario(page, logger, Path(djfut_local_path))
+        if not djfut_confirmado:
+            msg_djfut = f"No se confirmó la carga del DJFUT para DNI {dni}"
+            _registrar_error_tramite_en_comparacion(
+                logger,
+                compare_url,
+                compare_row_number,
+                compare_fieldnames,
+                msg_djfut,
+                fecha_hoy,
+            )
+            return False
+    except Exception as exc:
+        msg_djfut = f"Error al cargar DJFUT en formulario para DNI {dni}: {exc}"
+        logger.warning("[FORM][DJFUT] %s", msg_djfut)
+        _registrar_error_tramite_en_comparacion(
+            logger,
+            compare_url,
+            compare_row_number,
+            compare_fieldnames,
+            msg_djfut,
+            fecha_hoy,
+        )
+        return False
+
+    try:
+        cert_ok, cert_local_path, cert_nombre = preparar_certificado_medico_local_desde_drive(logger, dni)
+    except Exception as exc:
+        cert_ok, cert_local_path, cert_nombre = False, None, str(exc)
+
+    if not cert_ok or cert_local_path is None:
+        msg_cert = f"No se pudo extraer certificado médico del expediente Drive para DNI {dni}: {cert_nombre}"
+        _registrar_error_tramite_en_comparacion(
+            logger,
+            compare_url,
+            compare_row_number,
+            compare_fieldnames,
+            msg_cert,
+            fecha_hoy,
+        )
+        return False
+
+    item["drive_certificado_medico_local_path"] = str(cert_local_path)
+    item["drive_certificado_medico_nombre"] = cert_nombre
+
+    try:
+        cert_confirmado = cargar_archivo_certificado_medico_en_formulario(page, logger, Path(cert_local_path))
+        if not cert_confirmado:
+            msg_cert = f"No se confirmó la carga del certificado médico para DNI {dni}"
+            _registrar_error_tramite_en_comparacion(
+                logger,
+                compare_url,
+                compare_row_number,
+                compare_fieldnames,
+                msg_cert,
+                fecha_hoy,
+            )
+            return False
+    except Exception as exc:
+        msg_cert = f"Error al cargar certificado médico en formulario para DNI {dni}: {exc}"
+        logger.warning("[FORM][CERT_MED] %s", msg_cert)
+        _registrar_error_tramite_en_comparacion(
+            logger,
+            compare_url,
+            compare_row_number,
+            compare_fieldnames,
+            msg_cert,
+            fecha_hoy,
+        )
+        return False
 
     # Loop de secuencias con fallback por "No se encontró el recibo".
     secuencia_candidatos = item.get("terceros_libres", []) or []  # Usar terceros_libres del item
@@ -3014,6 +3295,68 @@ def _drive_pick_foto_file(files: list[dict], dni: str) -> dict | None:
     return candidatos[0][3]
 
 
+def _drive_pick_djfut_file(files: list[dict], dni: str) -> dict | None:
+    dni_digits = "".join(ch for ch in str(dni or "") if ch.isdigit())
+    candidatos = []
+
+    for item in files:
+        name = str(item.get("name", "") or "")
+        ext = Path(name).suffix.lower()
+        if ext != ".pdf":
+            continue
+
+        name_norm = _normalizar_columna(name)
+        puntaje = 80
+        if "djfut" in name_norm:
+            puntaje = 5
+        elif "dj" in name_norm:
+            puntaje = 15
+        elif "fut" in name_norm:
+            puntaje = 20
+
+        if dni_digits and dni_digits in "".join(ch for ch in name if ch.isdigit()):
+            puntaje -= 1
+
+        candidatos.append((puntaje, len(name), name_norm, item))
+
+    if not candidatos:
+        return None
+
+    candidatos.sort(key=lambda x: (x[0], x[1], x[2]))
+    return candidatos[0][3]
+
+
+def _drive_pick_certificado_medico_file(files: list[dict], dni: str) -> dict | None:
+    dni_digits = "".join(ch for ch in str(dni or "") if ch.isdigit())
+    candidatos = []
+
+    for item in files:
+        name = str(item.get("name", "") or "")
+        ext = Path(name).suffix.lower()
+        if ext != ".pdf":
+            continue
+
+        name_norm = _normalizar_columna(name)
+        puntaje = 80
+        if "certificado" in name_norm and "medico" in name_norm:
+            puntaje = 5
+        elif "certmed" in name_norm:
+            puntaje = 8
+        elif "cert" in name_norm and "med" in name_norm:
+            puntaje = 15
+
+        if dni_digits and dni_digits in "".join(ch for ch in name if ch.isdigit()):
+            puntaje -= 1
+
+        candidatos.append((puntaje, len(name), name_norm, item))
+
+    if not candidatos:
+        return None
+
+    candidatos.sort(key=lambda x: (x[0], x[1], x[2]))
+    return candidatos[0][3]
+
+
 def _drive_download_file_to_local(service, file_id: str, destino: Path) -> Path:
     request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
     contenido = request.execute()
@@ -3068,6 +3411,84 @@ def preparar_foto_local_desde_drive(logger: logging.Logger, dni: str) -> tuple[b
         destino.stat().st_size,
     )
     return True, destino, nombre_foto
+
+
+def preparar_djfut_local_desde_drive(logger: logging.Logger, dni: str) -> tuple[bool, Path | None, str]:
+    """Descarga el DJFUT PDF del expediente DNI a un path local para cargarlo en input file."""
+    root_folder_id = _drive_root_folder_id()
+    if not root_folder_id:
+        raise Exception("Falta DRIVE_ROOT_FOLDER_ID o CARNET_DRIVE_ROOT_FOLDER_ID en .env")
+
+    service = _drive_service()
+    dni_folder = _drive_find_dni_folder(service, root_folder_id, dni)
+    if not dni_folder:
+        return False, None, "No se encontró carpeta DNI para extraer DJFUT"
+
+    docs = _drive_supported_doc_files(_drive_list_documents(service, dni_folder["id"]))
+    if not docs:
+        return False, None, "No hay documentos soportados en la carpeta DNI"
+
+    djfut = _drive_pick_djfut_file(docs, dni)
+    if not djfut:
+        return False, None, "No se encontró PDF DJFUT en el expediente"
+
+    nombre_djfut = str(djfut.get("name", "") or "").strip()
+    djfut_id = str(djfut.get("id", "") or "").strip()
+    if not djfut_id:
+        return False, None, "El archivo DJFUT no tiene id en Drive"
+
+    dni_digits = "".join(ch for ch in str(dni or "") if ch.isdigit())
+    subdir = DATA_DIR / "cache" / "upload_tmp" / (dni_digits or "sin_dni")
+    destino = subdir / f"djfut_{dni_digits or 'prospecto'}.pdf"
+
+    _drive_download_file_to_local(service, djfut_id, destino)
+    logger.info(
+        "[DRIVE][%s] DJFUT descargado para upload | archivo_drive=%s | local=%s | size_bytes=%s",
+        dni,
+        nombre_djfut,
+        destino,
+        destino.stat().st_size,
+    )
+    return True, destino, nombre_djfut
+
+
+def preparar_certificado_medico_local_desde_drive(logger: logging.Logger, dni: str) -> tuple[bool, Path | None, str]:
+    """Descarga el certificado médico PDF del expediente DNI a un path local para cargarlo en input file."""
+    root_folder_id = _drive_root_folder_id()
+    if not root_folder_id:
+        raise Exception("Falta DRIVE_ROOT_FOLDER_ID o CARNET_DRIVE_ROOT_FOLDER_ID en .env")
+
+    service = _drive_service()
+    dni_folder = _drive_find_dni_folder(service, root_folder_id, dni)
+    if not dni_folder:
+        return False, None, "No se encontró carpeta DNI para extraer certificado médico"
+
+    docs = _drive_supported_doc_files(_drive_list_documents(service, dni_folder["id"]))
+    if not docs:
+        return False, None, "No hay documentos soportados en la carpeta DNI"
+
+    certificado = _drive_pick_certificado_medico_file(docs, dni)
+    if not certificado:
+        return False, None, "No se encontró PDF de certificado médico en el expediente"
+
+    nombre_cert = str(certificado.get("name", "") or "").strip()
+    cert_id = str(certificado.get("id", "") or "").strip()
+    if not cert_id:
+        return False, None, "El archivo de certificado médico no tiene id en Drive"
+
+    dni_digits = "".join(ch for ch in str(dni or "") if ch.isdigit())
+    subdir = DATA_DIR / "cache" / "upload_tmp" / (dni_digits or "sin_dni")
+    destino = subdir / f"certificado_medico_{dni_digits or 'prospecto'}.pdf"
+
+    _drive_download_file_to_local(service, cert_id, destino)
+    logger.info(
+        "[DRIVE][%s] Certificado médico descargado para upload | archivo_drive=%s | local=%s | size_bytes=%s",
+        dni,
+        nombre_cert,
+        destino,
+        destino.stat().st_size,
+    )
+    return True, destino, nombre_cert
 
 
 def validar_documentos_drive_por_dni(logger: logging.Logger, dni: str) -> tuple[bool, list[str]]:
