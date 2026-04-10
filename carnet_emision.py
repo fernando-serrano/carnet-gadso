@@ -841,6 +841,13 @@ def _leer_google_sheet_rows(sheet_url: str, logger: logging.Logger) -> tuple[lis
     return rows, list(reader.fieldnames or [])
 
 
+def confirmar_acceso_google_sheet(logger: logging.Logger, sheet_url: str, etiqueta: str) -> tuple[list, list]:
+    """Valida acceso a una hoja remota y registra solo una línea de confirmación."""
+    rows, fields = _leer_google_sheet_rows(sheet_url, logger)
+    logger.info("[%s] Acceso OK | filas=%s | columnas=%s", etiqueta, len(rows), len(fields))
+    return rows, fields
+
+
 def _extract_sheet_id_from_url(sheet_url: str) -> str:
     raw = str(sheet_url or "").strip()
     if not raw:
@@ -2371,6 +2378,27 @@ def procesar_registro_cruce_en_formulario(page, logger: logging.Logger, item: di
             )
         return False
 
+    # Valida documentos reales del expediente en Drive por DNI antes de continuar.
+    try:
+        drive_ok, drive_docs = validar_documentos_drive_por_dni(logger, dni)
+    except Exception as exc:
+        drive_ok, drive_docs = False, []
+        logger.warning("[DRIVE][%s] Falló validación de documentos: %s", dni, exc)
+
+    if not drive_ok:
+        msg_drive = f"No se encontraron documentos del expediente en Drive para DNI {dni} (pdf/png/jpg/jpeg)"
+        _registrar_error_tramite_en_comparacion(
+            logger,
+            compare_url,
+            compare_row_number,
+            compare_fieldnames,
+            msg_drive,
+            fecha_hoy,
+        )
+        return False
+
+    item["drive_docs_disponibles"] = drive_docs
+
     sede_sugerida = str(item.get("sede", "") or "").strip() or "LIMA"
     sede = sede_sugerida
     origen_dropdown = "no_verificado_dropdown"
@@ -2790,6 +2818,45 @@ def _drive_find_dni_folder(service, root_folder_id: str, dni: str) -> dict | Non
 def _drive_list_document_names(service, folder_id: str) -> list[str]:
     files = _drive_list_children(service, folder_id)
     return [f.get("name", "") for f in files if f.get("mimeType") != "application/vnd.google-apps.folder"]
+
+
+def _drive_supported_doc_names(names: list[str]) -> list[str]:
+    allowed = {".pdf", ".png", ".jpg", ".jpeg"}
+    salida = []
+    for name in names:
+        ext = Path(str(name or "")).suffix.lower()
+        if ext in allowed:
+            salida.append(str(name or ""))
+    return salida
+
+
+def validar_documentos_drive_por_dni(logger: logging.Logger, dni: str) -> tuple[bool, list[str]]:
+    """Valida carpeta DNI en Drive y confirma documentos soportados (pdf/png/jpg/jpeg)."""
+    root_folder_id = _drive_root_folder_id()
+    if not root_folder_id:
+        raise Exception("Falta DRIVE_ROOT_FOLDER_ID o CARNET_DRIVE_ROOT_FOLDER_ID en .env")
+
+    service = _drive_service()
+    logger.info("[DRIVE][%s] Validando documentos del expediente en Drive", dni)
+    dni_folder = _drive_find_dni_folder(service, root_folder_id, dni)
+    if not dni_folder:
+        logger.warning("[DRIVE][%s] No se encontró carpeta DNI en estructura año/mes", dni)
+        return False, []
+
+    names = _drive_list_document_names(service, dni_folder["id"])
+    docs = _drive_supported_doc_names(names)
+    if not docs:
+        logger.warning("[DRIVE][%s] Carpeta accesible pero sin documentos soportados (pdf/png/jpg/jpeg)", dni)
+        return False, []
+
+    logger.info(
+        "[DRIVE][%s] Acceso OK a expediente | carpeta=%s | documentos_soportados=%s | archivos=%s",
+        dni,
+        dni_folder.get("name", ""),
+        len(docs),
+        ", ".join(docs),
+    )
+    return True, docs
 
 
 def validar_drive_acceso_raiz(logger: logging.Logger, folder_id: str | None = None, max_items: int = 10) -> bool:
@@ -3352,49 +3419,19 @@ def ejecutar_flujo_secundario() -> int:
     logger = setup_logger("carnet_emision", suffix=child_suffix)
     logger.info("INICIANDO FLUJO CARNET - Login automático")
 
-    if _as_bool_env("CARNET_SHEET_PRINT_SAMPLE", default=True):
-        try:
-            max_rows = max(1, _safe_int_env("CARNET_SHEET_SAMPLE_ROWS", 5))
-            url_base = str(os.getenv("CARNET_GSHEET_URL", DEFAULT_GSHEET_URL) or DEFAULT_GSHEET_URL).strip()
-            esquema_base = [
-                ("dni", ["dni"]),
-                ("apellido_paterno", ["apellido paterno", "apellido_paterno", "ap paterno"]),
-                ("apellido_materno", ["apellido materno", "apellido_materno", "ap materno"]),
-                ("nombres", ["nombres", "nombre"]),
-                ("departamento", ["indicar el departamento donde labora o donde postuló", "indicar el departamento donde labora o donde postulo", "departamento"]),
-                ("puesto", ["puesto"]),
-            ]
-            imprimir_muestra_google_sheet_desde_url(logger, url_base, "HOJA_BASE", max_rows=max_rows, esquema_columnas=esquema_base)
-            previsualizar_mapeo_sedes_desde_hoja_base(logger, max_rows=max_rows)
+    try:
+        url_base = str(os.getenv("CARNET_GSHEET_URL", DEFAULT_GSHEET_URL) or DEFAULT_GSHEET_URL).strip()
+        confirmar_acceso_google_sheet(logger, url_base, "HOJA_BASE")
 
-            url_compare = str(os.getenv("CARNET_GSHEET_COMPARE_URL", DEFAULT_GSHEET_COMPARE_URL) or "").strip()
-            if url_compare:
-                esquema_compare = [
-                    ("compania", ["compania", "compañia", "empresa"]),
-                    ("dni", ["dni"]),
-                    ("responsable", ["responsable"]),
-                    ("estado", ["estado_tramite"]),
-                    ("observacion", ["observacion", "observaciones", "observ", "obs"]),
-                    ("fecha_tramite", ["fecha tramite", "fecha_tramite", "fechatramite", "fecha trámite"]),
-                ]
-                imprimir_muestra_google_sheet_desde_url(logger, url_compare, "HOJA_COMPARACION", max_rows=max_rows, esquema_columnas=esquema_compare)
+        url_compare = str(os.getenv("CARNET_GSHEET_COMPARE_URL", DEFAULT_GSHEET_COMPARE_URL) or "").strip()
+        if url_compare:
+            confirmar_acceso_google_sheet(logger, url_compare, "HOJA_COMPARACION")
 
-            url_third = str(os.getenv("CARNET_GSHEET_THIRD_URL", DEFAULT_GSHEET_THIRD_URL) or "").strip()
-            if url_third:
-                esquema_third = [
-                    ("ruc", ["ruc"]),
-                    ("solicitado_por", ["solicitado por", "solicitado_por"]),
-                    ("copia_secuencia_pago", ["copia de secuencia de pago", "copia secuencia de pago", "secuencia de pago"]),
-                    ("estado_secuencia_pago", ["estado secuencia de pago", "estado secuencia pago", "estado_secuencia_pago", "estado secuencia"]),
-                    ("dni", ["dni"]),
-                    ("apellidos_y_nombre", ["apellidos y nombre", "apellidos y nombres", "apellido y nombre", "nombres y apellidos"]),
-                ]
-                imprimir_muestra_google_sheet_desde_url(logger, url_third, "HOJA_TERCERA", max_rows=max_rows, esquema_columnas=esquema_third)
-        except Exception as exc:
-            logger.warning("No se pudo leer Google Sheet de muestra: %s", exc)
-
-    # Validación Drive no invasiva: solo logea acceso y nombres visibles de documentos.
-    prevalidar_drive_desde_hoja(logger, max_rows=max(1, _safe_int_env("CARNET_SHEET_SAMPLE_ROWS", 5)))
+        url_third = str(os.getenv("CARNET_GSHEET_THIRD_URL", DEFAULT_GSHEET_THIRD_URL) or "").strip()
+        if url_third:
+            confirmar_acceso_google_sheet(logger, url_third, "HOJA_TERCERA")
+    except Exception as exc:
+        logger.warning("No se pudo confirmar acceso a Google Sheets: %s", exc)
 
     if _as_bool_env("CARNET_SHEET_CROSSCHECK_ONLY", default=False):
         try:
@@ -3408,7 +3445,7 @@ def ejecutar_flujo_secundario() -> int:
         return 0
 
     if _as_bool_env("CARNET_SHEET_DEMO_ONLY", default=False):
-        logger.info("CARNET_SHEET_DEMO_ONLY=1 -> finaliza tras imprimir muestra del Google Sheet")
+        logger.info("CARNET_SHEET_DEMO_ONLY=1 -> finaliza tras confirmar acceso a Google Sheets")
         return 0
 
     if _as_bool_env("DRIVE_VALIDATE_ONLY", default=False):
