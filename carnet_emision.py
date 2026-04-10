@@ -95,12 +95,12 @@ SEL = {
     "crear_solicitud_documento_input": "#createForm\\:numDoc",
     "crear_solicitud_buscar_button": "#createForm\\:btnBuscarVigilante",
     "crear_solicitud_foto_input": "#createForm\\:idFoto_input",
-    "crear_solicitud_djfut_input": "#createForm\:archivoDJ_input",
-    "crear_solicitud_djfut_label": "#createForm\:archivoDJ_label",
-    "crear_solicitud_djfut_container": "#createForm\:archivoDJ",
-    "crear_solicitud_certificado_medico_input": "#createForm\:certificadoMedico_input",
-    "crear_solicitud_certificado_medico_label": "#createForm\:certificadoMedico_label",
-    "crear_solicitud_certificado_medico_container": "#createForm\:certificadoMedico",
+    "crear_solicitud_djfut_input": "#createForm\\:archivoDJ_input",
+    "crear_solicitud_djfut_label": "#createForm\\:archivoDJ_label",
+    "crear_solicitud_djfut_container": "#createForm\\:archivoDJ",
+    "crear_solicitud_certificado_medico_input": "#createForm\\:certificadoMedico_input",
+    "crear_solicitud_certificado_medico_label": "#createForm\\:certificadoMedico_label",
+    "crear_solicitud_certificado_medico_container": "#createForm\\:certificadoMedico",
 }
 
 SUCCESS_SELECTORS = [
@@ -1861,11 +1861,75 @@ def _leer_texto_upload_certificado_medico(page) -> str:
     return ""
 
 
-def cargar_archivo_foto_en_formulario(page, logger: logging.Logger, archivo_local: Path) -> bool:
+def _leer_error_upload(page, container_selector: str) -> str:
+    """Lee el mensaje de error visible de un componente PrimeFaces fileupload."""
+    selectores = [
+        f"{container_selector} .ui-messages-error-summary",
+        f"{container_selector} .ui-messages-error-detail",
+        f"{container_selector} .ui-messages-error",
+        f"{container_selector} .ui-messages",
+    ]
+    partes = []
+    for selector in selectores:
+        try:
+            loc = page.locator(selector).first
+            if loc.count() == 0:
+                continue
+            texto = str(loc.inner_text() or "").strip()
+            if texto and texto not in partes:
+                partes.append(texto)
+        except Exception:
+            continue
+    return " | ".join(partes).strip()
+
+
+def _validar_archivo_adjuntable_previo(
+    archivo_local: Path,
+    allowed_exts: set[str],
+    max_bytes: int,
+    etiqueta: str,
+) -> tuple[bool, str]:
+    """Valida extensión y tamaño antes de intentar la carga al formulario."""
+    ruta = Path(archivo_local)
+    if not ruta.exists() or not ruta.is_file():
+        return False, f"No existe el archivo local para carga de {etiqueta}: {ruta}"
+
+    ext = ruta.suffix.lower()
+    if allowed_exts and ext not in allowed_exts:
+        permitido = ", ".join(sorted({e.upper().lstrip('.') for e in allowed_exts}))
+        return False, f"Solo se permite {etiqueta} con extensión {permitido}."
+
+    try:
+        size_bytes = ruta.stat().st_size
+    except Exception as exc:
+        return False, f"No se pudo leer el tamaño de {etiqueta}: {exc}"
+
+    if max_bytes > 0 and size_bytes > max_bytes:
+        limite_mb = max_bytes / (1024 * 1024)
+        if limite_mb >= 1:
+            limite_txt = f"{limite_mb:.0f} MB"
+        else:
+            limite_txt = f"{int(max_bytes / 1024)} KB"
+        return False, f"El archivo supera el tamaño máximo permitido. tamaño máximo: {limite_txt}"
+
+    return True, ""
+
+
+def cargar_archivo_foto_en_formulario(page, logger: logging.Logger, archivo_local: Path) -> tuple[bool, str]:
     """Carga un archivo local en el input file de Foto sin usar el diálogo nativo de Windows."""
     ruta = Path(archivo_local)
     if not ruta.exists() or not ruta.is_file():
         raise Exception(f"No existe el archivo local para carga de foto: {ruta}")
+
+    ok_previo, msg_previo = _validar_archivo_adjuntable_previo(
+        ruta,
+        allowed_exts={".jpg", ".jpeg"},
+        max_bytes=_safe_int_env("CARNET_MAX_FOTO_BYTES", 80 * 1024),
+        etiqueta="foto",
+    )
+    if not ok_previo:
+        logger.warning("[FORM][FOTO] %s", msg_previo)
+        return False, msg_previo
 
     src_antes = _leer_src_preview_foto(page)
     input_foto = page.locator(SEL["crear_solicitud_foto_input"]).first
@@ -1873,6 +1937,11 @@ def cargar_archivo_foto_en_formulario(page, logger: logging.Logger, archivo_loca
     input_foto.set_input_files(str(ruta))
     esperar_ajax_primefaces(page, timeout_ms=7000)
     page.wait_for_timeout(250)
+
+    error_visible = _leer_error_upload(page, "#createForm\\:idFoto")
+    if error_visible:
+        logger.warning("[FORM][FOTO] Error visible del componente upload: %s", error_visible)
+        return False, error_visible
 
     nombre_cargado = str(
         input_foto.evaluate(
@@ -1890,27 +1959,37 @@ def cargar_archivo_foto_en_formulario(page, logger: logging.Logger, archivo_loca
                     src_antes or "N/D",
                     src_despues,
                 )
-                return True
+                return True, ""
             page.wait_for_timeout(200)
 
         logger.warning(
             "[FORM][FOTO] No se confirmó por input.files ni por cambio de preview src; en PrimeFaces puede limpiarse tras upload. Se continúa flujo."
         )
-        return False
+        return False, "No se pudo validar la carga de foto"
 
     logger.info(
         "[FORM][FOTO] Archivo cargado en input | local=%s | nombre_en_input=%s",
         ruta,
         nombre_cargado,
     )
-    return True
+    return True, ""
 
 
-def cargar_archivo_djfut_en_formulario(page, logger: logging.Logger, archivo_local: Path) -> bool:
+def cargar_archivo_djfut_en_formulario(page, logger: logging.Logger, archivo_local: Path) -> tuple[bool, str]:
     """Carga el PDF DJFUT en el input file correspondiente y confirma por texto visible."""
     ruta = Path(archivo_local)
     if not ruta.exists() or not ruta.is_file():
         raise Exception(f"No existe el archivo local para carga de DJFUT: {ruta}")
+
+    ok_previo, msg_previo = _validar_archivo_adjuntable_previo(
+        ruta,
+        allowed_exts={".pdf"},
+        max_bytes=_safe_int_env("CARNET_MAX_DJFUT_BYTES", 1 * 1024 * 1024),
+        etiqueta="DJFUT",
+    )
+    if not ok_previo:
+        logger.warning("[FORM][DJFUT] %s", msg_previo)
+        return False, msg_previo
 
     texto_antes = _leer_texto_upload_djfut(page)
     input_djfut = page.locator(SEL["crear_solicitud_djfut_input"]).first
@@ -1918,6 +1997,11 @@ def cargar_archivo_djfut_en_formulario(page, logger: logging.Logger, archivo_loc
     input_djfut.set_input_files(str(ruta))
     esperar_ajax_primefaces(page, timeout_ms=7000)
     page.wait_for_timeout(300)
+
+    error_visible = _leer_error_upload(page, "#createForm\\:archivoDJ")
+    if error_visible:
+        logger.warning("[FORM][DJFUT] Error visible del componente upload: %s", error_visible)
+        return False, error_visible
 
     nombre_esperado = ruta.name
     texto_despues = _leer_texto_upload_djfut(page)
@@ -1927,7 +2011,7 @@ def cargar_archivo_djfut_en_formulario(page, logger: logging.Logger, archivo_loc
             ruta,
             texto_despues,
         )
-        return True
+        return True, ""
 
     try:
         nombre_input = str(
@@ -1945,21 +2029,31 @@ def cargar_archivo_djfut_en_formulario(page, logger: logging.Logger, archivo_loc
             ruta,
             nombre_input,
         )
-        return True
+        return True, ""
 
     logger.warning(
         "[FORM][DJFUT] No se pudo confirmar la carga por texto visible ni por input.files | antes=%s | despues=%s",
         texto_antes or "N/D",
         texto_despues or "N/D",
     )
-    return False
+    return False, "No se pudo validar la carga de DJFUT"
 
 
-def cargar_archivo_certificado_medico_en_formulario(page, logger: logging.Logger, archivo_local: Path) -> bool:
+def cargar_archivo_certificado_medico_en_formulario(page, logger: logging.Logger, archivo_local: Path) -> tuple[bool, str]:
     """Carga el certificado médico en el input file correspondiente y confirma por nombre visible."""
     ruta = Path(archivo_local)
     if not ruta.exists() or not ruta.is_file():
         raise Exception(f"No existe el archivo local para carga de certificado médico: {ruta}")
+
+    ok_previo, msg_previo = _validar_archivo_adjuntable_previo(
+        ruta,
+        allowed_exts={".pdf"},
+        max_bytes=_safe_int_env("CARNET_MAX_CERT_MED_BYTES", 1 * 1024 * 1024),
+        etiqueta="certificado médico",
+    )
+    if not ok_previo:
+        logger.warning("[FORM][CERT_MED] %s", msg_previo)
+        return False, msg_previo
 
     texto_antes = _leer_texto_upload_certificado_medico(page)
     input_cert = page.locator(SEL["crear_solicitud_certificado_medico_input"]).first
@@ -1967,6 +2061,11 @@ def cargar_archivo_certificado_medico_en_formulario(page, logger: logging.Logger
     input_cert.set_input_files(str(ruta))
     esperar_ajax_primefaces(page, timeout_ms=7000)
     page.wait_for_timeout(300)
+
+    error_visible = _leer_error_upload(page, "#createForm\\:certificadoMedico")
+    if error_visible:
+        logger.warning("[FORM][CERT_MED] Error visible del componente upload: %s", error_visible)
+        return False, error_visible
 
     nombre_esperado = ruta.name
     texto_despues = _leer_texto_upload_certificado_medico(page)
@@ -1976,7 +2075,7 @@ def cargar_archivo_certificado_medico_en_formulario(page, logger: logging.Logger
             ruta,
             texto_despues,
         )
-        return True
+        return True, ""
 
     try:
         nombre_input = str(
@@ -1994,14 +2093,14 @@ def cargar_archivo_certificado_medico_en_formulario(page, logger: logging.Logger
             ruta,
             nombre_input,
         )
-        return True
+        return True, ""
 
     logger.warning(
         "[FORM][CERT_MED] No se pudo confirmar la carga por texto visible ni por input.files | antes=%s | despues=%s",
         texto_antes or "N/D",
         texto_despues or "N/D",
     )
-    return False
+    return False, "No se pudo validar la carga del certificado médico"
 
 
 def _script_monitor_carnet_growl_js() -> str:
@@ -2893,15 +2992,30 @@ def procesar_registro_cruce_en_formulario(page, logger: logging.Logger, item: di
         logger.warning("[FORM][FOTO] No se preparó archivo local de foto para DNI %s. Se continúa flujo.", dni)
     else:
         try:
-            foto_confirmada = cargar_archivo_foto_en_formulario(page, logger, Path(foto_local_path))
+            foto_confirmada, foto_mensaje = cargar_archivo_foto_en_formulario(page, logger, Path(foto_local_path))
             if not foto_confirmada:
-                logger.warning("[FORM][FOTO] Carga sin confirmación explícita; se continúa con validación de comprobante")
+                msg_foto = foto_mensaje or f"No se pudo validar la carga de foto para DNI {dni}"
+                _registrar_error_tramite_en_comparacion(
+                    logger,
+                    compare_url,
+                    compare_row_number,
+                    compare_fieldnames,
+                    msg_foto,
+                    fecha_hoy,
+                )
+                return False
         except Exception as exc:
-            logger.warning(
-                "[FORM][FOTO] Error al cargar foto en formulario para DNI %s: %s. Se continúa flujo.",
-                dni,
-                exc,
+            msg_foto = f"Error al cargar foto en formulario para DNI {dni}: {exc}"
+            logger.warning("[FORM][FOTO] %s", msg_foto)
+            _registrar_error_tramite_en_comparacion(
+                logger,
+                compare_url,
+                compare_row_number,
+                compare_fieldnames,
+                msg_foto,
+                fecha_hoy,
             )
+            return False
 
     djfut_local_path = str(item.get("drive_djfut_local_path", "") or "").strip()
     if not djfut_local_path:
@@ -2918,9 +3032,9 @@ def procesar_registro_cruce_en_formulario(page, logger: logging.Logger, item: di
         return False
 
     try:
-        djfut_confirmado = cargar_archivo_djfut_en_formulario(page, logger, Path(djfut_local_path))
+        djfut_confirmado, djfut_mensaje = cargar_archivo_djfut_en_formulario(page, logger, Path(djfut_local_path))
         if not djfut_confirmado:
-            msg_djfut = f"No se confirmó la carga del DJFUT para DNI {dni}"
+            msg_djfut = djfut_mensaje or f"No se confirmó la carga del DJFUT para DNI {dni}"
             _registrar_error_tramite_en_comparacion(
                 logger,
                 compare_url,
@@ -2964,9 +3078,9 @@ def procesar_registro_cruce_en_formulario(page, logger: logging.Logger, item: di
     item["drive_certificado_medico_nombre"] = cert_nombre
 
     try:
-        cert_confirmado = cargar_archivo_certificado_medico_en_formulario(page, logger, Path(cert_local_path))
+        cert_confirmado, cert_mensaje = cargar_archivo_certificado_medico_en_formulario(page, logger, Path(cert_local_path))
         if not cert_confirmado:
-            msg_cert = f"No se confirmó la carga del certificado médico para DNI {dni}"
+            msg_cert = cert_mensaje or f"No se confirmó la carga del certificado médico para DNI {dni}"
             _registrar_error_tramite_en_comparacion(
                 logger,
                 compare_url,
