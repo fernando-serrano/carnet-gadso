@@ -1894,15 +1894,23 @@ def _validar_archivo_adjuntable_previo(
     if not ruta.exists() or not ruta.is_file():
         return False, f"No existe el archivo local para carga de {etiqueta}: {ruta}"
 
-    ext = ruta.suffix.lower()
-    if allowed_exts and ext not in allowed_exts:
-        permitido = ", ".join(sorted({e.upper().lstrip('.') for e in allowed_exts}))
-        return False, f"Solo se permite {etiqueta} con extensión {permitido}."
+    def _fmt_size(size_bytes: int) -> str:
+        kb = float(size_bytes) / 1024.0
+        if kb >= 1024:
+            return f"{(kb / 1024.0):.1f} MB"
+        return f"{kb:.1f} KB"
 
     try:
         size_bytes = ruta.stat().st_size
     except Exception as exc:
         return False, f"No se pudo leer el tamaño de {etiqueta}: {exc}"
+
+    detalle_archivo = f"{ruta.name} {_fmt_size(size_bytes)}"
+
+    ext = ruta.suffix.lower()
+    if allowed_exts and ext not in allowed_exts:
+        permitido = ", ".join(sorted({e.upper().lstrip('.') for e in allowed_exts}))
+        return False, f"Solo se permite {etiqueta} con extensión {permitido}. | {detalle_archivo}"
 
     if max_bytes > 0 and size_bytes > max_bytes:
         limite_mb = max_bytes / (1024 * 1024)
@@ -1910,7 +1918,7 @@ def _validar_archivo_adjuntable_previo(
             limite_txt = f"{limite_mb:.0f} MB"
         else:
             limite_txt = f"{int(max_bytes / 1024)} KB"
-        return False, f"El archivo supera el tamaño máximo permitido. tamaño máximo: {limite_txt}"
+        return False, f"El archivo supera el tamaño máximo permitido. tamaño máximo: {limite_txt} | {detalle_archivo}"
 
     return True, ""
 
@@ -1984,10 +1992,13 @@ def cargar_archivo_djfut_en_formulario(page, logger: logging.Logger, archivo_loc
     ok_previo, msg_previo = _validar_archivo_adjuntable_previo(
         ruta,
         allowed_exts={".pdf"},
-        max_bytes=_safe_int_env("CARNET_MAX_DJFUT_BYTES", 1 * 1024 * 1024),
+        max_bytes=_safe_int_env("CARNET_MAX_DJFUT_BYTES", 80 * 1024),
         etiqueta="DJFUT",
     )
     if not ok_previo:
+        if "tamaño máximo" in (msg_previo or "").lower() or "tamano maximo" in (msg_previo or "").lower():
+            size_txt = f"{(ruta.stat().st_size / 1024.0):.1f} KB"
+            msg_previo = f"Solo se permite subir archivos con un máximo de 80 Kb. | {ruta.name} {size_txt}"
         logger.warning("[FORM][DJFUT] %s", msg_previo)
         return False, msg_previo
 
@@ -2048,10 +2059,13 @@ def cargar_archivo_certificado_medico_en_formulario(page, logger: logging.Logger
     ok_previo, msg_previo = _validar_archivo_adjuntable_previo(
         ruta,
         allowed_exts={".pdf"},
-        max_bytes=_safe_int_env("CARNET_MAX_CERT_MED_BYTES", 1 * 1024 * 1024),
+        max_bytes=_safe_int_env("CARNET_MAX_CERT_MED_BYTES", 160 * 1024),
         etiqueta="certificado médico",
     )
     if not ok_previo:
+        if "tamaño máximo" in (msg_previo or "").lower() or "tamano maximo" in (msg_previo or "").lower():
+            size_txt = f"{(ruta.stat().st_size / 1024.0):.1f} KB"
+            msg_previo = f"Solo se permite subir archivos con un máximo de 160 Kb. | {ruta.name} {size_txt}"
         logger.warning("[FORM][CERT_MED] %s", msg_previo)
         return False, msg_previo
 
