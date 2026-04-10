@@ -2148,6 +2148,69 @@ def detectar_error_documento_no_existe(page, max_wait_ms: int = 4500, min_ts_ms:
         page.wait_for_timeout(120)
 
 
+def detectar_error_carne_vigente_otra_empresa(page, max_wait_ms: int = 4500, min_ts_ms: int | None = None) -> tuple[bool, str]:
+    """
+    Detecta alerta de SUCAMEC cuando la persona ya cuenta con carné vigente
+    en una empresa distinta.
+    """
+    deadline = time.time() + (max(0, int(max_wait_ms)) / 1000.0)
+
+    def _es_mensaje_objetivo(texto: str) -> bool:
+        t = _normalizar_columna(texto)
+        return (
+            "no puede sacar" in t
+            and "carne" in t
+            and "personal de seguridad" in t
+            and "ya cuenta con uno" in t
+            and "distinta empresa" in t
+        )
+
+    while True:
+        try:
+            buffer = obtener_buffer_carnet_growl(page) or []
+            for msg_dict in buffer:
+                if min_ts_ms is not None:
+                    try:
+                        ts = int(msg_dict.get("ts", 0) or 0)
+                        if ts and ts < int(min_ts_ms):
+                            continue
+                    except Exception:
+                        pass
+                texto = str(msg_dict.get("text", "") or "").strip()
+                if _es_mensaje_objetivo(texto):
+                    return True, texto
+        except Exception:
+            pass
+
+        for selector in [
+            ".ui-growl-item .ui-growl-title",
+            ".ui-growl-item .ui-growl-message",
+            "#mensajesGrowl_container .ui-growl-title",
+            "#mensajesGrowl_container .ui-growl-message",
+        ]:
+            try:
+                loc = page.locator(selector)
+                total = min(loc.count(), 8)
+                for i in range(total):
+                    texto = (loc.nth(i).text_content() or "").strip()
+                    if _es_mensaje_objetivo(texto):
+                        return True, texto
+            except Exception:
+                pass
+
+        try:
+            html = (page.content() or "")
+            if _es_mensaje_objetivo(html):
+                return True, "Esta persona no puede sacar un carné de personal de seguridad con esta empresa porque ya cuenta con uno en una distinta empresa"
+        except Exception:
+            pass
+
+        if time.time() >= deadline:
+            return False, ""
+
+        page.wait_for_timeout(120)
+
+
 def _registrar_error_tramite_en_comparacion(
     logger: logging.Logger,
     compare_url: str,
@@ -2404,6 +2467,31 @@ def procesar_registro_cruce_en_formulario(page, logger: logging.Logger, item: di
             msg_doc_no_existe.strip()
             if str(msg_doc_no_existe or "").strip()
             else "El documento ingresado no existe"
+        )
+        logger.warning("[FORM] [ERROR_TRAMITE] %s", msg_tramite)
+
+        _registrar_error_tramite_en_comparacion(
+            logger,
+            compare_url,
+            compare_row_number,
+            compare_fieldnames,
+            msg_tramite,
+            fecha_hoy,
+        )
+
+        return False
+
+    # Validacion pendiente 4/4: carné vigente en otra empresa.
+    carne_vigente_otra_empresa, msg_carne_vigente_otra_empresa = detectar_error_carne_vigente_otra_empresa(
+        page,
+        max_wait_ms=4500,
+        min_ts_ms=ts_busqueda_ms,
+    )
+    if carne_vigente_otra_empresa:
+        msg_tramite = (
+            msg_carne_vigente_otra_empresa.strip()
+            if str(msg_carne_vigente_otra_empresa or "").strip()
+            else "Esta persona no puede sacar un carné de personal de seguridad con esta empresa porque ya cuenta con uno en una distinta empresa"
         )
         logger.warning("[FORM] [ERROR_TRAMITE] %s", msg_tramite)
 
