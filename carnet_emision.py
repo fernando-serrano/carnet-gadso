@@ -94,6 +94,7 @@ SEL = {
     "crear_solicitud_verificar_recibo_button": '#createForm\\:btnBuscarRecibo',
     "crear_solicitud_documento_input": "#createForm\\:numDoc",
     "crear_solicitud_buscar_button": "#createForm\\:btnBuscarVigilante",
+    "crear_solicitud_foto_input": "#createForm\\:idFoto_input",
 }
 
 SUCCESS_SELECTORS = [
@@ -1797,6 +1798,37 @@ def ingresar_copia_secuencia_pago(page, valor_secuencia: str) -> None:
     esperar_ajax_primefaces(page, timeout_ms=7000)
 
 
+def cargar_archivo_foto_en_formulario(page, logger: logging.Logger, archivo_local: Path) -> bool:
+    """Carga un archivo local en el input file de Foto sin usar el diálogo nativo de Windows."""
+    ruta = Path(archivo_local)
+    if not ruta.exists() or not ruta.is_file():
+        raise Exception(f"No existe el archivo local para carga de foto: {ruta}")
+
+    input_foto = page.locator(SEL["crear_solicitud_foto_input"]).first
+    input_foto.wait_for(state="attached", timeout=12000)
+    input_foto.set_input_files(str(ruta))
+    page.wait_for_timeout(250)
+
+    nombre_cargado = str(
+        input_foto.evaluate(
+            "el => (el && el.files && el.files.length > 0 && el.files[0] && el.files[0].name) ? el.files[0].name : ''"
+        )
+        or ""
+    ).strip()
+    if not nombre_cargado:
+        logger.warning(
+            "[FORM][FOTO] No se pudo confirmar por input.files; en PrimeFaces puede limpiarse tras el upload. Se continúa flujo."
+        )
+        return False
+
+    logger.info(
+        "[FORM][FOTO] Archivo cargado en input | local=%s | nombre_en_input=%s",
+        ruta,
+        nombre_cargado,
+    )
+    return True
+
+
 def _script_monitor_carnet_growl_js() -> str:
     """
     Script JS que instala un MutationObserver para capturar mensajes growl en tiempo real.
@@ -2444,6 +2476,26 @@ def procesar_registro_cruce_en_formulario(page, logger: logging.Logger, item: di
 
     item["drive_docs_disponibles"] = drive_docs
 
+    try:
+        foto_ok, foto_local_path, foto_nombre = preparar_foto_local_desde_drive(logger, dni)
+    except Exception as exc:
+        foto_ok, foto_local_path, foto_nombre = False, None, str(exc)
+
+    if not foto_ok or foto_local_path is None:
+        msg_foto = f"No se pudo extraer foto del expediente Drive para DNI {dni}: {foto_nombre}"
+        _registrar_error_tramite_en_comparacion(
+            logger,
+            compare_url,
+            compare_row_number,
+            compare_fieldnames,
+            msg_foto,
+            fecha_hoy,
+        )
+        return False
+
+    item["drive_foto_local_path"] = str(foto_local_path)
+    item["drive_foto_nombre"] = foto_nombre
+
     sede_sugerida = str(item.get("sede", "") or "").strip() or "LIMA"
     sede = sede_sugerida
     origen_dropdown = "no_verificado_dropdown"
@@ -2640,6 +2692,21 @@ def procesar_registro_cruce_en_formulario(page, logger: logging.Logger, item: di
             fecha_hoy,
         )
         return False
+
+    foto_local_path = str(item.get("drive_foto_local_path", "") or "").strip()
+    if not foto_local_path:
+        logger.warning("[FORM][FOTO] No se preparó archivo local de foto para DNI %s. Se continúa flujo.", dni)
+    else:
+        try:
+            foto_confirmada = cargar_archivo_foto_en_formulario(page, logger, Path(foto_local_path))
+            if not foto_confirmada:
+                logger.warning("[FORM][FOTO] Carga sin confirmación explícita; se continúa con validación de comprobante")
+        except Exception as exc:
+            logger.warning(
+                "[FORM][FOTO] Error al cargar foto en formulario para DNI %s: %s. Se continúa flujo.",
+                dni,
+                exc,
+            )
 
     # Loop de secuencias con fallback por "No se encontró el recibo".
     secuencia_candidatos = item.get("terceros_libres", []) or []  # Usar terceros_libres del item
@@ -2890,6 +2957,117 @@ def _drive_supported_doc_names(names: list[str]) -> list[str]:
         if ext in allowed:
             salida.append(str(name or ""))
     return salida
+
+
+def _drive_list_documents(service, folder_id: str) -> list[dict]:
+    files = _drive_list_children(service, folder_id)
+    return [f for f in files if f.get("mimeType") != "application/vnd.google-apps.folder"]
+
+
+def _drive_supported_doc_files(files: list[dict]) -> list[dict]:
+    allowed = {".pdf", ".png", ".jpg", ".jpeg"}
+    salida = []
+    for item in files:
+        name = str(item.get("name", "") or "")
+        ext = Path(name).suffix.lower()
+        if ext in allowed:
+            salida.append(item)
+    return salida
+
+
+def _drive_pick_foto_file(files: list[dict], dni: str) -> dict | None:
+    image_exts = {".jpg", ".jpeg", ".png"}
+    candidatos = []
+    dni_digits = "".join(ch for ch in str(dni or "") if ch.isdigit())
+
+    for item in files:
+        name = str(item.get("name", "") or "")
+        ext = Path(name).suffix.lower()
+        if ext not in image_exts:
+            continue
+
+        name_norm = _normalizar_columna(name)
+        puntaje = 80
+        if "foto_carne" in name_norm or ("foto" in name_norm and "carne" in name_norm):
+            puntaje = 10
+        elif "foto" in name_norm:
+            puntaje = 20
+        elif "imagen" in name_norm:
+            puntaje = 30
+        elif "selfie" in name_norm:
+            puntaje = 40
+        elif "firma" in name_norm:
+            puntaje = 90
+
+        if ext in {".jpg", ".jpeg"}:
+            puntaje -= 2
+
+        if dni_digits and dni_digits in "".join(ch for ch in name if ch.isdigit()):
+            puntaje -= 1
+
+        candidatos.append((puntaje, len(name), name_norm, item))
+
+    if not candidatos:
+        return None
+
+    candidatos.sort(key=lambda x: (x[0], x[1], x[2]))
+    return candidatos[0][3]
+
+
+def _drive_download_file_to_local(service, file_id: str, destino: Path) -> Path:
+    request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
+    contenido = request.execute()
+    if not isinstance(contenido, (bytes, bytearray)):
+        raise Exception("La descarga de Drive no devolvió contenido binario")
+
+    destino.parent.mkdir(parents=True, exist_ok=True)
+    destino.write_bytes(bytes(contenido))
+    if not destino.exists() or destino.stat().st_size <= 0:
+        raise Exception(f"El archivo descargado quedó vacío: {destino}")
+    return destino
+
+
+def preparar_foto_local_desde_drive(logger: logging.Logger, dni: str) -> tuple[bool, Path | None, str]:
+    """Descarga la foto del expediente DNI a un path local para cargarla en input file."""
+    root_folder_id = _drive_root_folder_id()
+    if not root_folder_id:
+        raise Exception("Falta DRIVE_ROOT_FOLDER_ID o CARNET_DRIVE_ROOT_FOLDER_ID en .env")
+
+    service = _drive_service()
+    dni_folder = _drive_find_dni_folder(service, root_folder_id, dni)
+    if not dni_folder:
+        return False, None, "No se encontró carpeta DNI para extraer foto"
+
+    docs = _drive_supported_doc_files(_drive_list_documents(service, dni_folder["id"]))
+    if not docs:
+        return False, None, "No hay documentos soportados en la carpeta DNI"
+
+    foto = _drive_pick_foto_file(docs, dni)
+    if not foto:
+        return False, None, "No se encontró imagen de foto (.jpg/.jpeg/.png) en el expediente"
+
+    nombre_foto = str(foto.get("name", "") or "").strip()
+    foto_id = str(foto.get("id", "") or "").strip()
+    if not foto_id:
+        return False, None, "El archivo de foto no tiene id en Drive"
+
+    ext = Path(nombre_foto).suffix.lower()
+    if ext not in {".jpg", ".jpeg", ".png"}:
+        ext = ".jpg"
+
+    dni_digits = "".join(ch for ch in str(dni or "") if ch.isdigit())
+    subdir = DATA_DIR / "cache" / "upload_tmp" / (dni_digits or "sin_dni")
+    destino = subdir / f"foto_carne_{dni_digits or 'prospecto'}{ext}"
+
+    _drive_download_file_to_local(service, foto_id, destino)
+    logger.info(
+        "[DRIVE][%s] Foto descargada para upload | archivo_drive=%s | local=%s | size_bytes=%s",
+        dni,
+        nombre_foto,
+        destino,
+        destino.stat().st_size,
+    )
+    return True, destino, nombre_foto
 
 
 def validar_documentos_drive_por_dni(logger: logging.Logger, dni: str) -> tuple[bool, list[str]]:
