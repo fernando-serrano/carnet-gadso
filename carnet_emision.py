@@ -87,6 +87,9 @@ SEL = {
     "crear_solicitud_tipo_doc_trigger": '#createForm\\:tipoDoc .ui-selectonemenu-trigger',
     "crear_solicitud_tipo_doc_label": '#createForm\\:tipoDoc_label',
     "crear_solicitud_tipo_doc_panel": '#createForm\\:tipoDoc_panel',
+    "crear_solicitud_nombres_input": "#createForm\\:nombres",
+    "crear_solicitud_ape_pat_input": "#createForm\\:apePat",
+    "crear_solicitud_ape_mat_input": "#createForm\\:apeMat",
     "crear_solicitud_nro_secuencia_input": '#createForm\\:nroSecuencia',
     "crear_solicitud_verificar_recibo_button": '#createForm\\:btnBuscarRecibo',
     "crear_solicitud_documento_input": "#createForm\\:numDoc",
@@ -1925,6 +1928,16 @@ def detectar_mensaje_carne_cesado(page, max_wait_ms: int = 5000) -> tuple[bool, 
     """
     deadline = time.time() + (max(0, int(max_wait_ms)) / 1000.0)
     
+    def _es_alerta_cambio_empresa(texto: str) -> bool:
+        t = _normalizar_columna(texto)
+        if not t:
+            return False
+        if "carne" in t and "cesado" in t:
+            return True
+        if "personal de seguridad" in t and "ya cuenta con el carne nro" in t:
+            return True
+        return False
+
     while True:
         mensajes = []
         
@@ -1960,16 +1973,15 @@ def detectar_mensaje_carne_cesado(page, max_wait_ms: int = 5000) -> tuple[bool, 
         
         # 3. Fallback: buscar en HTML del documento (incluye nodos ocultos)
         try:
-            html_doc = (page.content() or "").lower()
-            if "carne" in html_doc and "cesado" in html_doc:
-                return True, "Mensaje de carné cesado detectado en HTML de página"
+            html_doc = page.content() or ""
+            if _es_alerta_cambio_empresa(html_doc):
+                return True, "Mensaje de cambio de empresa detectado en HTML de página"
         except Exception:
             pass
         
         # Evaluar todos los mensajes capturados
         for msg in mensajes:
-            msg_low = msg.lower()
-            if "carne" in msg_low and "cesado" in msg_low:
+            if _es_alerta_cambio_empresa(msg):
                 return True, msg
         
         # Chequear si venció el deadline
@@ -2254,24 +2266,22 @@ def _registrar_error_tramite_en_comparacion(
         logger.warning("[FORM] No se pudo actualizar campos de error de trámite en comparación: %s", exc)
 
 
-def reintentar_busqueda_con_cambio_empresa(page, logger: logging.Logger, dni: str) -> None:
+def reintentar_busqueda_con_cambio_empresa(page, logger: logging.Logger, dni: str, max_wait_ms: int = 1200) -> None:
     """
-    Sub-validación: si se detectó carné cesado, cambia a CAMBIO DE EMPRESA y rebusca.
+    Sub-validación: si se detecta alerta que exige CAMBIO DE EMPRESA, cambia el tipo y rebusca.
     Usa polling activo con deadline (5 segundos) para capturar mensajes confiablemente.
     """
     # Asegurar que el monitor está activo (monitorea en background)
     activar_monitor_carnet_growl(page)
     
-    # Polling activo con deadline de 5 segundos (cubre tiempo de AJAX + renderizado)
-    logger.info("[SUB-VALIDACION] Iniciando búsqueda con polling activo (5 seg) para detectar carné cesado...")
-    encontrado, msg = detectar_mensaje_carne_cesado(page, max_wait_ms=5000)
+    # Verificación corta para no penalizar el flujo base cuando no hay mensaje.
+    encontrado, msg = detectar_mensaje_carne_cesado(page, max_wait_ms=max_wait_ms)
     
     if not encontrado:
-        logger.info("[SUB-VALIDACION] No hay mensaje de carné cesado. Búsqueda válida con tipo INICIAL.")
         return
 
     logger.warning(
-        "[SUB-VALIDACION] *** DETECTADO carné cesado: %s",
+        "[SUB-VALIDACION] *** DETECTADA alerta de CAMBIO DE EMPRESA: %s",
         msg,
     )
     logger.info("[SUB-VALIDACION] Cambiando Tipo de Registro a CAMBIO DE EMPRESA...")
@@ -2282,6 +2292,41 @@ def reintentar_busqueda_con_cambio_empresa(page, logger: logging.Logger, dni: st
     logger.info("[SUB-VALIDACION] Reintentando Buscar con DNI=%s tipo CAMBIO DE EMPRESA", dni_limpio)
     ingresar_documento_y_buscar(page, dni_limpio)
     logger.info("[SUB-VALIDACION] Búsqueda reintentada con CAMBIO DE EMPRESA")
+
+
+def validar_autocompletado_datos_inicial(page, logger: logging.Logger) -> tuple[bool, str]:
+    """Valida que Nombres/Apellidos se hayan cargado cuando el tipo de registro es INICIAL."""
+    try:
+        tipo_reg_text = (page.locator(SEL["crear_solicitud_tipo_registro_label"]).first.inner_text() or "").strip()
+    except Exception:
+        tipo_reg_text = ""
+
+    tipo_reg_norm = _normalizar_columna(tipo_reg_text)
+    if tipo_reg_norm != "inicial":
+        return True, ""
+
+    def _leer_valor(selector: str) -> str:
+        try:
+            loc = page.locator(selector).first
+            loc.wait_for(state="attached", timeout=4000)
+            return str(loc.input_value() or "").strip()
+        except Exception:
+            return ""
+
+    nombres = _leer_valor(SEL["crear_solicitud_nombres_input"])
+    ape_pat = _leer_valor(SEL["crear_solicitud_ape_pat_input"])
+    ape_mat = _leer_valor(SEL["crear_solicitud_ape_mat_input"])
+
+    if nombres and ape_pat and ape_mat:
+        logger.info(
+            "[FORM] [INICIAL] Datos autocompletados OK | NOMBRES=%s | APE_PAT=%s | APE_MAT=%s",
+            nombres,
+            ape_pat,
+            ape_mat,
+        )
+        return True, ""
+
+    return False, "Registro INICIAL sin autocompletado de Nombres/Apellido Paterno/Apellido Materno"
 
 
 def detectar_resultado_verificacion_comprobante(page, max_wait_ms: int = 5000, min_ts_ms: int | None = None) -> tuple[str, str]:
@@ -2484,10 +2529,13 @@ def procesar_registro_cruce_en_formulario(page, logger: logging.Logger, item: di
     ingresar_documento_y_buscar(page, dni_limpio)
     logger.info("[FORM] Búsqueda de documento ejecutada")
 
+    # Timeout corto y configurable para validaciones post-Buscar.
+    post_search_wait_ms = max(300, _safe_int_env("CARNET_POST_SEARCH_ALERT_WAIT_MS", 1200))
+
     # Validacion pendiente 3/3: DNI inexistente en SUCAMEC.
     documento_no_existe, msg_doc_no_existe = detectar_error_documento_no_existe(
         page,
-        max_wait_ms=4500,
+        max_wait_ms=post_search_wait_ms,
         min_ts_ms=ts_busqueda_ms,
     )
     if documento_no_existe:
@@ -2512,7 +2560,7 @@ def procesar_registro_cruce_en_formulario(page, logger: logging.Logger, item: di
     # Validacion pendiente 4/4: carné vigente en otra empresa.
     carne_vigente_otra_empresa, msg_carne_vigente_otra_empresa = detectar_error_carne_vigente_otra_empresa(
         page,
-        max_wait_ms=4500,
+        max_wait_ms=post_search_wait_ms,
         min_ts_ms=ts_busqueda_ms,
     )
     if carne_vigente_otra_empresa:
@@ -2535,10 +2583,10 @@ def procesar_registro_cruce_en_formulario(page, logger: logging.Logger, item: di
         return False
 
     # Si aparece carné cesado, esta rutina cambia a CAMBIO DE EMPRESA y reintenta Buscar.
-    reintentar_busqueda_con_cambio_empresa(page, logger, dni_limpio)
+    reintentar_busqueda_con_cambio_empresa(page, logger, dni_limpio, max_wait_ms=post_search_wait_ms)
 
     # Validacion pendiente 1/3: registro en misma modalidad en estado OBSERVADO.
-    observado, msg_observado = detectar_error_tramite_observado(page, max_wait_ms=4500, min_ts_ms=ts_busqueda_ms)
+    observado, msg_observado = detectar_error_tramite_observado(page, max_wait_ms=post_search_wait_ms, min_ts_ms=ts_busqueda_ms)
     if observado:
         msg_tramite = (
             msg_observado.strip()
@@ -2559,7 +2607,7 @@ def procesar_registro_cruce_en_formulario(page, logger: logging.Logger, item: di
         return False
 
     # Validacion pendiente 2/3: prospecto sin curso SUCAMEC vigente.
-    curso_no_vigente, msg_curso = detectar_error_curso_no_vigente(page, max_wait_ms=4500, min_ts_ms=ts_busqueda_ms)
+    curso_no_vigente, msg_curso = detectar_error_curso_no_vigente(page, max_wait_ms=post_search_wait_ms, min_ts_ms=ts_busqueda_ms)
     if curso_no_vigente:
         msg_tramite = (
             msg_curso.strip()
@@ -2577,6 +2625,20 @@ def procesar_registro_cruce_en_formulario(page, logger: logging.Logger, item: di
             fecha_hoy,
         )
 
+        return False
+
+    # Si el tipo de registro quedó en INICIAL, validar que SUCAMEC haya autocompletado datos personales.
+    ok_inicial, msg_inicial = validar_autocompletado_datos_inicial(page, logger)
+    if not ok_inicial:
+        logger.warning("[FORM] [ERROR_TRAMITE] %s", msg_inicial)
+        _registrar_error_tramite_en_comparacion(
+            logger,
+            compare_url,
+            compare_row_number,
+            compare_fieldnames,
+            msg_inicial,
+            fecha_hoy,
+        )
         return False
 
     # Loop de secuencias con fallback por "No se encontró el recibo".
