@@ -42,9 +42,21 @@ Regla clave:
 
 ### Validacion documental en Drive
 
-- Se valida por DNI real en estructura de carpetas (raiz -> anio -> mes -> DNI).
+- Se valida por DNI real en estructura de carpetas `expedientes_carnet/{anio}/{mes}/{dni}`.
 - Se consideran documentos soportados: `.pdf`, `.png`, `.jpg`, `.jpeg`.
-- Si no hay carpeta DNI o no hay documentos soportados, el registro se marca como error de tramite.
+- El flujo identifica y descarga localmente los adjuntos requeridos antes de abrir el formulario.
+- Si no hay carpeta DNI o no hay documentos soportados, el registro se marca como `ERROR EN TRAMITE`.
+- La confirmacion de carga no depende solo del input HTML: se valida por evidencia visual del componente PrimeFaces.
+
+### Carga documental automatizada en SUCAMEC
+
+El flujo actual completa la carga de adjuntos en el formulario con validaciones especificas por tipo de documento:
+
+- Foto: archivo local descargado desde Drive, validado por extension y peso, confirmado por cambio en el `src` del preview.
+- DJFUT: PDF local descargado desde Drive, validado por extension y peso, confirmado por texto visible del componente de upload o por `input.files`.
+- Certificado medico: PDF local descargado desde Drive, validado por extension y peso, confirmado por texto visible del componente de upload o por `input.files`.
+- Si el componente PrimeFaces devuelve error visible, el flujo registra la causa exacta y detiene el tramite.
+- Si una carga falla, la observacion se enriquece con nombre de archivo y tamaño para trazabilidad inmediata.
 
 ### Interaccion web SUCAMEC
 
@@ -66,7 +78,7 @@ Regla clave:
 
 Nota:
 
-- Ya no se imprime la muestra de 5 registros por hoja.
+- Ya no se imprime la muestra de 5 registros por hoja.  
 - Ya no se hace prevalidacion inicial de Drive basada en esos 5 registros.
 
 ### 2) Cruce y seleccion de registro pendiente
@@ -129,6 +141,8 @@ Si cualquier validacion bloqueante falla:
 - escribe responsable y fecha,
 - termina el registro sin pasar a secuencias.
 
+Si no se detecta una alerta bloqueante, el flujo descarga y carga Foto, DJFUT y Certificado medico desde Drive antes de continuar con la verificacion de secuencias.
+
 ### 7) Verificacion de secuencia de pago
 
 1. Itera candidatos de secuencia.
@@ -182,6 +196,15 @@ Si cualquier validacion bloqueante falla:
 ### Validaciones de comprobante
 
 - Recibo encontrado / no encontrado con fallback por multiples fuentes de evidencia.
+
+### Validaciones de adjuntos
+
+- Foto: solo `.jpg` y `.jpeg`, con limite configurable de 80 KB por defecto.
+- DJFUT: solo `.pdf`, con limite configurable de 80 KB por defecto.
+- Certificado medico: solo `.pdf`, con limite configurable de 160 KB por defecto.
+- Se valida extension y peso antes de intentar la carga al formulario.
+- Se valida el resultado por señales visuales del componente y por el contenido del archivo asociado al input.
+- Ante rechazo de carga, se registra el detalle en observacion y se clasifica el caso como `ERROR EN TRAMITE`.
 
 ## Excepciones y manejo de errores
 
@@ -257,6 +280,13 @@ Errores frecuentes y respuesta del sistema:
 
 - `DRIVE_ROOT_FOLDER_ID`
 - `DRIVE_CREDENTIALS_JSON`
+- `DRIVE_VALIDATE_ON_START`
+
+### Limites de adjuntos
+
+- `CARNET_MAX_FOTO_BYTES`
+- `CARNET_MAX_DJFUT_BYTES`
+- `CARNET_MAX_CERT_MED_BYTES`
 
 ### Ejecucion y tiempos
 
@@ -331,5 +361,5 @@ python carnet_emision.py
 
 ## Estado actual de carga documental
 
-Actualmente el flujo valida acceso y presencia de documentos en Drive por DNI.
-La etapa de descarga de esos archivos y carga automatica en inputs tipo file de SUCAMEC no esta implementada aun en el flujo principal.
+Actualmente el flujo valida acceso, localiza, descarga y carga automaticamente los documentos requeridos en el formulario de SUCAMEC.
+La trazabilidad operativa queda reflejada en logs y en la hoja de comparacion, incluyendo el archivo afectado, su tamano y el motivo del rechazo cuando aplica.

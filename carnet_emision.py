@@ -1,6 +1,7 @@
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -1888,17 +1889,109 @@ def _validar_archivo_adjuntable_previo(
     allowed_exts: set[str],
     max_bytes: int,
     etiqueta: str,
-) -> tuple[bool, str]:
+) -> tuple[bool, str, Path]:
     """Valida extensión y tamaño antes de intentar la carga al formulario."""
     ruta = Path(archivo_local)
     if not ruta.exists() or not ruta.is_file():
-        return False, f"No existe el archivo local para carga de {etiqueta}: {ruta}"
+        return False, f"No existe el archivo local para carga de {etiqueta}: {ruta}", ruta
 
     def _fmt_size(size_bytes: int) -> str:
         kb = float(size_bytes) / 1024.0
         if kb >= 1024:
             return f"{(kb / 1024.0):.1f} MB"
         return f"{kb:.1f} KB"
+
+    def _optimizar_pdf_pikepdf(src: Path, dst: Path) -> tuple[bool, str]:
+        try:
+            pikepdf = importlib.import_module("pikepdf")
+        except Exception:
+            return False, "pikepdf no disponible"
+
+        try:
+            with pikepdf.open(str(src)) as pdf:
+                try:
+                    pdf.docinfo.clear()
+                except Exception:
+                    pass
+                try:
+                    pdf.save(
+                        str(dst),
+                        compress_streams=True,
+                        object_stream_mode=pikepdf.ObjectStreamMode.generate,
+                        linearize=False,
+                    )
+                except TypeError:
+                    pdf.save(str(dst), compress_streams=True)
+            return True, "optimizacion sin perdida"
+        except Exception as exc:
+            return False, f"fallo pikepdf: {exc}"
+
+    def _optimizar_pdf_ghostscript(src: Path, dst: Path, preset: str) -> tuple[bool, str]:
+        gs_bin = None
+        for candidate in ("gswin64c", "gswin32c", "gs"):
+            found = shutil.which(candidate)
+            if found:
+                gs_bin = found
+                break
+        if not gs_bin:
+            return False, "ghostscript no disponible"
+
+        cmd = [
+            gs_bin,
+            "-sDEVICE=pdfwrite",
+            "-dCompatibilityLevel=1.4",
+            f"-dPDFSETTINGS={preset}",
+            "-dNOPAUSE",
+            "-dQUIET",
+            "-dBATCH",
+            f"-sOutputFile={dst}",
+            str(src),
+        ]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+            if proc.returncode != 0:
+                stderr_txt = (proc.stderr or proc.stdout or "").strip()
+                return False, f"ghostscript rc={proc.returncode} {stderr_txt}"
+            return True, f"ghostscript {preset}"
+        except Exception as exc:
+            return False, f"fallo ghostscript: {exc}"
+
+    def _preparar_pdf_para_limite(src: Path, limite_bytes: int) -> tuple[Path, str]:
+        if limite_bytes <= 0:
+            return src, ""
+
+        try:
+            current_size = src.stat().st_size
+        except Exception:
+            return src, ""
+        if current_size <= limite_bytes:
+            return src, ""
+
+        out_base = src.with_name(f"{src.stem}_opt{src.suffix}")
+        detalles = []
+
+        ok_lossless, detalle_lossless = _optimizar_pdf_pikepdf(src, out_base)
+        if ok_lossless and out_base.exists() and out_base.stat().st_size > 0:
+            detalles.append(f"{detalle_lossless}: {_fmt_size(current_size)} -> {_fmt_size(out_base.stat().st_size)}")
+            if out_base.stat().st_size <= limite_bytes:
+                return out_base, "; ".join(detalles)
+        elif detalle_lossless:
+            detalles.append(detalle_lossless)
+
+        permitir_lossy = _as_bool_env("CARNET_PDF_ALLOW_LOSSY_OPTIMIZATION", default=False)
+        if not permitir_lossy:
+            return src, "; ".join(detalles)
+
+        for preset in ("/printer", "/ebook", "/screen"):
+            ok_gs, detalle_gs = _optimizar_pdf_ghostscript(src, out_base, preset)
+            if ok_gs and out_base.exists() and out_base.stat().st_size > 0:
+                detalles.append(f"{detalle_gs}: {_fmt_size(current_size)} -> {_fmt_size(out_base.stat().st_size)}")
+                if out_base.stat().st_size <= limite_bytes:
+                    return out_base, "; ".join(detalles)
+            elif detalle_gs:
+                detalles.append(detalle_gs)
+
+        return src, "; ".join(detalles)
 
     try:
         size_bytes = ruta.stat().st_size
@@ -1910,7 +2003,16 @@ def _validar_archivo_adjuntable_previo(
     ext = ruta.suffix.lower()
     if allowed_exts and ext not in allowed_exts:
         permitido = ", ".join(sorted({e.upper().lstrip('.') for e in allowed_exts}))
-        return False, f"Solo se permite {etiqueta} con extensión {permitido}. | {detalle_archivo}"
+        return False, f"Solo se permite {etiqueta} con extensión {permitido}. | {detalle_archivo}", ruta
+
+    if ext == ".pdf" and max_bytes > 0 and size_bytes > max_bytes:
+        ruta_ajustada, detalle_opt = _preparar_pdf_para_limite(ruta, max_bytes)
+        if ruta_ajustada != ruta:
+            ruta = ruta_ajustada
+            size_bytes = ruta.stat().st_size
+            detalle_archivo = f"{ruta.name} {_fmt_size(size_bytes)}"
+        if detalle_opt:
+            detalle_archivo = f"{detalle_archivo} | {detalle_opt}"
 
     if max_bytes > 0 and size_bytes > max_bytes:
         limite_mb = max_bytes / (1024 * 1024)
@@ -1918,9 +2020,9 @@ def _validar_archivo_adjuntable_previo(
             limite_txt = f"{limite_mb:.0f} MB"
         else:
             limite_txt = f"{int(max_bytes / 1024)} KB"
-        return False, f"El archivo supera el tamaño máximo permitido. tamaño máximo: {limite_txt} | {detalle_archivo}"
+        return False, f"El archivo supera el tamaño máximo permitido. tamaño máximo: {limite_txt} | {detalle_archivo}", ruta
 
-    return True, ""
+    return True, "", ruta
 
 
 def cargar_archivo_foto_en_formulario(page, logger: logging.Logger, archivo_local: Path) -> tuple[bool, str]:
@@ -1929,7 +2031,7 @@ def cargar_archivo_foto_en_formulario(page, logger: logging.Logger, archivo_loca
     if not ruta.exists() or not ruta.is_file():
         raise Exception(f"No existe el archivo local para carga de foto: {ruta}")
 
-    ok_previo, msg_previo = _validar_archivo_adjuntable_previo(
+    ok_previo, msg_previo, ruta_validada = _validar_archivo_adjuntable_previo(
         ruta,
         allowed_exts={".jpg", ".jpeg"},
         max_bytes=_safe_int_env("CARNET_MAX_FOTO_BYTES", 80 * 1024),
@@ -1938,6 +2040,7 @@ def cargar_archivo_foto_en_formulario(page, logger: logging.Logger, archivo_loca
     if not ok_previo:
         logger.warning("[FORM][FOTO] %s", msg_previo)
         return False, msg_previo
+    ruta = ruta_validada
 
     src_antes = _leer_src_preview_foto(page)
     input_foto = page.locator(SEL["crear_solicitud_foto_input"]).first
@@ -1989,7 +2092,7 @@ def cargar_archivo_djfut_en_formulario(page, logger: logging.Logger, archivo_loc
     if not ruta.exists() or not ruta.is_file():
         raise Exception(f"No existe el archivo local para carga de DJFUT: {ruta}")
 
-    ok_previo, msg_previo = _validar_archivo_adjuntable_previo(
+    ok_previo, msg_previo, ruta_validada = _validar_archivo_adjuntable_previo(
         ruta,
         allowed_exts={".pdf"},
         max_bytes=_safe_int_env("CARNET_MAX_DJFUT_BYTES", 80 * 1024),
@@ -1997,10 +2100,14 @@ def cargar_archivo_djfut_en_formulario(page, logger: logging.Logger, archivo_loc
     )
     if not ok_previo:
         if "tamaño máximo" in (msg_previo or "").lower() or "tamano maximo" in (msg_previo or "").lower():
-            size_txt = f"{(ruta.stat().st_size / 1024.0):.1f} KB"
-            msg_previo = f"Solo se permite subir archivos con un máximo de 80 Kb. | {ruta.name} {size_txt}"
+            detalle = msg_previo.split("|", 1)[1].strip() if "|" in (msg_previo or "") else f"{ruta.name} {(ruta.stat().st_size / 1024.0):.1f} KB"
+            msg_previo = f"Solo se permite subir archivos con un máximo de 80 Kb. | {detalle}"
         logger.warning("[FORM][DJFUT] %s", msg_previo)
         return False, msg_previo
+    ruta = ruta_validada
+
+    if ruta != Path(archivo_local):
+        logger.info("[FORM][DJFUT] Se usará PDF optimizado para upload: %s", ruta)
 
     texto_antes = _leer_texto_upload_djfut(page)
     input_djfut = page.locator(SEL["crear_solicitud_djfut_input"]).first
@@ -2056,7 +2163,7 @@ def cargar_archivo_certificado_medico_en_formulario(page, logger: logging.Logger
     if not ruta.exists() or not ruta.is_file():
         raise Exception(f"No existe el archivo local para carga de certificado médico: {ruta}")
 
-    ok_previo, msg_previo = _validar_archivo_adjuntable_previo(
+    ok_previo, msg_previo, ruta_validada = _validar_archivo_adjuntable_previo(
         ruta,
         allowed_exts={".pdf"},
         max_bytes=_safe_int_env("CARNET_MAX_CERT_MED_BYTES", 160 * 1024),
@@ -2064,10 +2171,14 @@ def cargar_archivo_certificado_medico_en_formulario(page, logger: logging.Logger
     )
     if not ok_previo:
         if "tamaño máximo" in (msg_previo or "").lower() or "tamano maximo" in (msg_previo or "").lower():
-            size_txt = f"{(ruta.stat().st_size / 1024.0):.1f} KB"
-            msg_previo = f"Solo se permite subir archivos con un máximo de 160 Kb. | {ruta.name} {size_txt}"
+            detalle = msg_previo.split("|", 1)[1].strip() if "|" in (msg_previo or "") else f"{ruta.name} {(ruta.stat().st_size / 1024.0):.1f} KB"
+            msg_previo = f"Solo se permite subir archivos con un máximo de 160 Kb. | {detalle}"
         logger.warning("[FORM][CERT_MED] %s", msg_previo)
         return False, msg_previo
+    ruta = ruta_validada
+
+    if ruta != Path(archivo_local):
+        logger.info("[FORM][CERT_MED] Se usará PDF optimizado para upload: %s", ruta)
 
     texto_antes = _leer_texto_upload_certificado_medico(page)
     input_cert = page.locator(SEL["crear_solicitud_certificado_medico_input"]).first
@@ -3350,6 +3461,20 @@ def _drive_find_dni_folder(service, root_folder_id: str, dni: str) -> dict | Non
             for item in _drive_list_children(service, month_folder["id"]):
                 if item.get("mimeType") == "application/vnd.google-apps.folder" and _normalizar_columna(item.get("name", "")) == target:
                     return item
+
+    # Fallback robusto: busca el DNI en subcarpetas de hasta 2 niveles
+    # para soportar historicos en anyo/mes distinto al actual.
+    for level1 in root_children:
+        if level1.get("mimeType") != "application/vnd.google-apps.folder":
+            continue
+        for level2 in _drive_list_children(service, level1["id"]):
+            if level2.get("mimeType") != "application/vnd.google-apps.folder":
+                continue
+            if _normalizar_columna(level2.get("name", "")) == target:
+                return level2
+            for level3 in _drive_list_children(service, level2["id"]):
+                if level3.get("mimeType") == "application/vnd.google-apps.folder" and _normalizar_columna(level3.get("name", "")) == target:
+                    return level3
     return None
 
 
@@ -3629,7 +3754,7 @@ def validar_documentos_drive_por_dni(logger: logging.Logger, dni: str) -> tuple[
     logger.info("[DRIVE][%s] Validando documentos del expediente en Drive", dni)
     dni_folder = _drive_find_dni_folder(service, root_folder_id, dni)
     if not dni_folder:
-        logger.warning("[DRIVE][%s] No se encontró carpeta DNI en estructura año/mes", dni)
+        logger.warning("[DRIVE][%s] No se encontró carpeta DNI (buscado en raiz y subestructura)", dni)
         return False, []
 
     names = _drive_list_document_names(service, dni_folder["id"])
