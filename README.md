@@ -164,8 +164,29 @@ Si no se detecta una alerta bloqueante, el flujo descarga y carga Foto, DJFUT y 
 
 ### 8) Cierre
 
-- Si el registro se completa: limpia observacion y registra fecha en comparacion.
-- Si `HOLD_BROWSER_OPEN=1`, mantiene navegador abierto hasta interrupcion manual.
+Secuencia actual de cierre transaccional:
+
+1. Guardar solicitud en `createForm:botonGuardar`.
+2. Actualizar hoja de comparacion a estado post-guardar (por defecto `POR TRAMSMITIR`) con responsable y fecha.
+3. Marcar la secuencia en tercera hoja como `USADO`, registrando trazabilidad adicional:
+   - `SOLICITADO POR=BOT CARNÉ SUCAMEC`
+   - `DNI`
+   - `APELLIDOS Y NOMBRE`
+4. Navegar a Bandeja de Emision.
+5. Aplicar filtro de estado (`CREADO` por defecto), ejecutar Buscar y seleccionar todos los resultados.
+6. Accionar `Transmitir` en bandeja.
+7. Confirmar el modal `Transmisión de registros` accionando el botón `Transmitir` del dialogo (`frmCompletarProceso:j_idt418`).
+8. Recién después de la confirmación del modal, actualizar hoja de comparacion a:
+   - `ESTADO_TRAMITE=TRANSMITIDO`
+   - `OBSERVACION=Transmitido sin observaciones` (configurable)
+   - responsable y fecha.
+9. Ejecutar limpieza de cache local por DNI en `data/cache/upload_tmp/<dni>` (si esta habilitado).
+
+Nota de performance:
+
+- El nombre completo para tercera hoja se captura antes de Guardar para evitar esperas por lectura de DOM durante la redirección automática a bandeja.
+
+Si `HOLD_BROWSER_OPEN=1`, mantiene navegador abierto hasta interrupcion manual.
 
 ## Validaciones implementadas
 
@@ -263,6 +284,12 @@ Errores frecuentes y respuesta del sistema:
 - Marca `NO ENCONTRADO` en tercera hoja.
 - Toma siguiente secuencia candidata.
 
+### Escenario G: Transmision en bandeja con confirmacion modal
+
+- Ejecuta flujo de bandeja: Buscar -> seleccionar todos -> Transmitir.
+- Confirma modal `dlgCompletarProceso` con el botón de transmisión.
+- Actualiza estado final en comparacion solo tras esa confirmacion.
+
 ## Variables de entorno relevantes
 
 ### Credenciales SUCAMEC
@@ -287,6 +314,20 @@ Errores frecuentes y respuesta del sistema:
 - `CARNET_MAX_FOTO_BYTES`
 - `CARNET_MAX_DJFUT_BYTES`
 - `CARNET_MAX_CERT_MED_BYTES`
+
+### Estados y cierre post-guardar
+
+- `CARNET_ESTADO_POST_GUARDAR`
+- `CARNET_OBSERVACION_POST_GUARDAR`
+- `CARNET_BANDEJA_ESTADO_OBJETIVO`
+- `CARNET_OBSERVACION_POST_TRANSMITIR`
+
+### Mantenimiento de cache y logs
+
+- `CARNET_CACHE_CLEAN_ON_SUCCESS`: limpia `data/cache/upload_tmp/<dni>` al cierre exitoso.
+- `CARNET_LOG_SINGLE_FILE`: cuando es `1`, usa log único (`carnet_emision.log`).
+- `CARNET_LOG_MAX_LINES`: umbral de truncado para log único (default 10000 líneas).
+- `CARNET_LOG_ROTATING_KEEP_FILES`: en modo rotativo (`CARNET_LOG_SINGLE_FILE=0`), retiene solo N archivos por patrón y elimina los más antiguos.
 
 ### Ejecucion y tiempos
 
@@ -330,7 +371,14 @@ El log registra:
 5. Selecciones de formulario (sede, modalidad, tipo registro, tipo documento).
 6. Alertas detectadas y decisiones de cambio/error.
 7. Verificacion de secuencias y resultado final.
-8. Escrituras realizadas en hojas.
+8. Escrituras realizadas en hojas (comparacion y tercera hoja).
+9. Flujo de bandeja y confirmacion de modal de transmisión.
+10. Limpieza de cache local por DNI cuando el registro termina en transmitido.
+
+Politica de logs implementada:
+
+- Modo archivo único: si supera `CARNET_LOG_MAX_LINES`, se trunca al inicio de ejecución.
+- Modo rotativo: se purgan archivos antiguos segun `CARNET_LOG_ROTATING_KEEP_FILES`, preservando siempre los más recientes.
 
 ## Instalacion
 
@@ -363,3 +411,4 @@ python carnet_emision.py
 
 Actualmente el flujo valida acceso, localiza, descarga y carga automaticamente los documentos requeridos en el formulario de SUCAMEC.
 La trazabilidad operativa queda reflejada en logs y en la hoja de comparacion, incluyendo el archivo afectado, su tamano y el motivo del rechazo cuando aplica.
+Adicionalmente, el cierre de bandeja/transmision y la limpieza de cache local post-exito quedan registrados de forma explicita.
