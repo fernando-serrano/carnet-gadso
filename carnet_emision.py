@@ -76,6 +76,8 @@ SEL = {
     "menu_item_carne": '.ui-menuitem-link:has(span.ui-menuitem-text:text-is("CARNÉ")), .ui-menuitem-link:has(span.ui-menuitem-text:text-is("CARNE")), .ui-menuitem-link:has(span.ui-menuitem-text:has-text("CARN"))',
     "menu_item_crear_solicitud": '.ui-menuitem-link:has(span.ui-menuitem-text:text-is("CREAR SOLICITUD")), .ui-menuitem-link:has(span.ui-menuitem-text:has-text("CREAR SOLICITUD"))',
     "menu_item_crear_solicitud_onclick": 'a[onclick*="addSubmitParam"][onclick*="j_idt11:menuprincipal"]:has(span.ui-menuitem-text:text-is("CREAR SOLICITUD")), a[onclick*="addSubmitParam"][onclick*="j_idt11:menuPrincipal"]:has(span.ui-menuitem-text:text-is("CREAR SOLICITUD"))',
+    "menu_item_bandeja_emision": '.ui-menuitem-link:has(span.ui-menuitem-text:text-is("BANDEJA DE EMISIÓN")), .ui-menuitem-link:has(span.ui-menuitem-text:text-is("BANDEJA DE EMISION")), .ui-menuitem-link:has(span.ui-menuitem-text:has-text("BANDEJA DE EMIS"))',
+    "menu_item_bandeja_emision_onclick": 'a[onclick*="addSubmitParam"][onclick*="j_idt11:menuprincipal"]:has(span.ui-menuitem-text:text-is("BANDEJA DE EMISIÓN")), a[onclick*="addSubmitParam"][onclick*="j_idt11:menuprincipal"]:has(span.ui-menuitem-text:text-is("BANDEJA DE EMISION")), a[onclick*="addSubmitParam"][onclick*="j_idt11:menuPrincipal"]:has(span.ui-menuitem-text:text-is("BANDEJA DE EMISIÓN")), a[onclick*="addSubmitParam"][onclick*="j_idt11:menuPrincipal"]:has(span.ui-menuitem-text:text-is("BANDEJA DE EMISION"))',
     "crear_solicitud_sede_trigger": '#createForm\\:dondeRecoger .ui-selectonemenu-trigger',
     "crear_solicitud_sede_label": '#createForm\\:dondeRecoger_label',
     "crear_solicitud_sede_panel": '#createForm\\:dondeRecoger_panel',
@@ -102,6 +104,14 @@ SEL = {
     "crear_solicitud_certificado_medico_input": "#createForm\\:certificadoMedico_input",
     "crear_solicitud_certificado_medico_label": "#createForm\\:certificadoMedico_label",
     "crear_solicitud_certificado_medico_container": "#createForm\\:certificadoMedico",
+    "crear_solicitud_guardar_button": "#createForm\\:botonGuardar",
+    "bandeja_estado_trigger": '#listForm\\:tipoFormacion .ui-selectonemenu-trigger',
+    "bandeja_estado_label": "#listForm\\:tipoFormacion_label",
+    "bandeja_estado_panel": "#listForm\\:tipoFormacion_panel",
+    "bandeja_buscar_button": '#listForm\\:j_idt56, #listForm\\:btnBuscar, #listForm\\:botonBuscar, #listForm\\:buscar, button[id*="listForm"][id*="Buscar"]',
+    "bandeja_resultados_tbody": "#listForm\\:dtResultados_data",
+    "bandeja_select_all_checkbox": "#listForm\\:dtResultados .ui-chkbox-all .ui-chkbox-box, #listForm\\:dtResultados_head .ui-chkbox-all .ui-chkbox-box",
+    "bandeja_transmitir_button": '#listForm\\:j_idt67, button[id*="listForm"][id*="j_idt67"], button:has-text("Transmitir")',
 }
 
 SUCCESS_SELECTORS = [
@@ -1146,6 +1156,14 @@ def _cargar_cruce_pendiente_desde_hojas(logger: logging.Logger, max_rows: int = 
         fields_third,
         ["estado secuencia de pago", "estado secuencia pago", "estado_secuencia_pago", "estado secuencia"],
     )
+    col_third_solicitado_por = _resolver_columna(
+        fields_third,
+        ["solicitado por", "solicitado_por", "solicitadopor"],
+    )
+    col_third_apellidos_nombre = _resolver_columna(
+        fields_third,
+        ["apellidos y nombre", "apellido y nombre", "apellidos nombres", "apellidos y nombres", "apellidos_nombre"],
+    )
 
     if not col_base_dni or not col_base_departamento:
         raise Exception("La hoja base no contiene DNI y/o departamento")
@@ -1299,6 +1317,9 @@ def _cargar_cruce_pendiente_desde_hojas(logger: logging.Logger, max_rows: int = 
                 "fieldnames_compare": fields_compare,
                 "fieldnames_third": fields_third,
                 "col_third_estado_sec": col_third_estado_sec,
+                "col_third_solicitado_por": col_third_solicitado_por,
+                "col_third_apellidos_nombre": col_third_apellidos_nombre,
+                "col_third_dni": col_third_dni,
                 "tercera_url": url_third,
                 "col_cmp_obs": col_cmp_obs,
                 "col_cmp_fecha": col_cmp_fecha,
@@ -2697,6 +2718,270 @@ def _registrar_error_tramite_en_comparacion(
         logger.warning("[FORM] No se pudo actualizar campos de error de trámite en comparación: %s", exc)
 
 
+def _registrar_estado_post_guardar_en_comparacion(
+    logger: logging.Logger,
+    compare_url: str,
+    compare_row_number: int,
+    compare_fieldnames: list[str],
+    fecha_tramite: str,
+) -> None:
+    """Registra estado post-guardar exitoso en la hoja de comparación."""
+    if not compare_url or compare_row_number <= 0:
+        return
+
+    estado_post = str(os.getenv("CARNET_ESTADO_POST_GUARDAR", "POR TRAMSMITIR") or "POR TRAMSMITIR").strip()
+    observacion_post = str(os.getenv("CARNET_OBSERVACION_POST_GUARDAR", "SOLICITUD GUARDADA") or "SOLICITUD GUARDADA").strip()
+
+    try:
+        _actualizar_fila_comparacion_por_row(
+            logger,
+            compare_url,
+            compare_row_number,
+            {
+                "observacion": observacion_post,
+                "observación": observacion_post,
+                "estado_tramite": estado_post,
+                "estado tramite": estado_post,
+                "responsable": "BOT CARNÉ SUCAMEC",
+                "fecha tramite": str(fecha_tramite or "").strip(),
+                "fecha_tramite": str(fecha_tramite or "").strip(),
+            },
+            fieldnames=compare_fieldnames,
+        )
+        logger.info(
+            "[FORM] Fila comparacion %s actualizada a estado post-guardar: %s",
+            compare_row_number,
+            estado_post,
+        )
+    except Exception as exc:
+        logger.warning("[FORM] No se pudo actualizar estado post-guardar en comparación: %s", exc)
+
+
+def _marcar_secuencia_usada_en_tercera_hoja(
+    logger: logging.Logger,
+    item: dict,
+    dni: str,
+    nombre_completo: str,
+) -> None:
+    """Marca la secuencia usada en tercera hoja y completa trazabilidad básica."""
+    tercera_url = str(item.get("tercera_url", "") or "").strip()
+    tercera_row = int(item.get("tercera_row_number", 0) or 0)
+    third_fieldnames = item.get("fieldnames_third", []) or []
+    col_estado = item.get("col_third_estado_sec")
+    col_solicitado_por = item.get("col_third_solicitado_por")
+    col_apellidos_nombre = item.get("col_third_apellidos_nombre")
+    col_dni = item.get("col_third_dni")
+
+    if not tercera_url or tercera_row <= 0:
+        logger.info("[FORM] Sin fila válida en tercera hoja para marcar secuencia usada")
+        return
+
+    updates = {}
+    if col_estado:
+        updates[col_estado] = "USADO"
+    if col_solicitado_por:
+        updates[col_solicitado_por] = "BOT CARNÉ SUCAMEC"
+    if col_dni:
+        updates[col_dni] = str(dni or "").strip()
+    if col_apellidos_nombre:
+        updates[col_apellidos_nombre] = str(nombre_completo or "").strip()
+
+    if not updates:
+        logger.warning("[FORM] No se resolvieron columnas de tercera hoja para marcar secuencia usada")
+        return
+
+    try:
+        _actualizar_fila_tercera_hoja_por_row(
+            logger,
+            tercera_url,
+            tercera_row,
+            updates,
+            fieldnames=third_fieldnames,
+        )
+        logger.info("[FORM] Tercera hoja actualizada en fila %s con ESTADO SECUENCIA DE PAGO=USADO", tercera_row)
+    except Exception as exc:
+        logger.warning("[FORM] No se pudo actualizar tercera hoja para secuencia usada: %s", exc)
+
+
+def guardar_solicitud_creada(page, logger: logging.Logger) -> tuple[bool, str]:
+    """Acciona el botón Guardar en Crear Solicitud y espera finalización AJAX."""
+    try:
+        btn = page.locator(SEL["crear_solicitud_guardar_button"]).first
+        btn.wait_for(state="visible", timeout=12000)
+    except Exception as exc:
+        return False, f"No se encontró botón Guardar en Crear Solicitud: {exc}"
+
+    try:
+        aria_disabled = str(btn.get_attribute("aria-disabled") or "").strip().lower()
+        if aria_disabled == "true":
+            return False, "Botón Guardar está deshabilitado"
+    except Exception:
+        pass
+
+    try:
+        btn.click(timeout=9000)
+    except Exception:
+        try:
+            ok_js = page.evaluate(
+                """() => {
+                    const b = document.getElementById('createForm:botonGuardar');
+                    if (!b) return false;
+                    b.click();
+                    return true;
+                }"""
+            )
+            if not ok_js:
+                return False, "No se pudo ejecutar click en botón Guardar"
+        except Exception as exc:
+            return False, f"Falló click en botón Guardar: {exc}"
+
+    esperar_ajax_primefaces(page, timeout_ms=9000)
+    page.wait_for_timeout(350)
+    logger.info("[FORM] Botón Guardar accionado correctamente")
+    return True, ""
+
+
+def navegar_dssp_carne_bandeja_carnes(page, logger: logging.Logger) -> None:
+    """Navega por DSSP -> CARNÉ -> BANDEJA DE EMISIÓN (Bandeja de Carnés)."""
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=8000)
+    except Exception:
+        pass
+
+    # Fast-path por texto del link JSF.
+    try:
+        page.locator(SEL["menu_root"]).first.wait_for(state="visible", timeout=5000)
+        click_directo = page.evaluate(
+            """() => {
+                const textosObjetivo = ['BANDEJA DE EMISIÓN', 'BANDEJA DE EMISION', 'BANDEJA DE CARNÉS', 'BANDEJA DE CARNES'];
+                const anchors = Array.from(document.querySelectorAll('a[onclick*="addSubmitParam"][onclick*="menuprincipal"], a[onclick*="addSubmitParam"][onclick*="menuPrincipal"]'));
+                const target = anchors.find((a) => {
+                    const t = ((a.textContent || '').replace(/\\s+/g, ' ').trim().toUpperCase());
+                    return textosObjetivo.some((x) => t === x || t.includes(x));
+                });
+                if (!target) return false;
+                target.click();
+                return true;
+            }"""
+        )
+        if click_directo:
+            logger.info("Fast-path: click directo en BANDEJA DE EMISIÓN")
+            try:
+                page.wait_for_load_state("networkidle", timeout=7000)
+            except Exception:
+                pass
+            esperar_ajax_primefaces(page, timeout_ms=5000)
+            return
+    except Exception:
+        pass
+
+    root = page.locator(SEL["menu_root"]).first
+    root.wait_for(state="visible", timeout=12000)
+
+    header_dssp = root.locator(SEL["menu_header_dssp"]).first
+    header_dssp.wait_for(state="visible", timeout=8000)
+
+    aria_expanded = (header_dssp.get_attribute("aria-expanded") or "").strip().lower()
+    if aria_expanded != "true":
+        header_dssp.click(timeout=8000)
+        page.wait_for_timeout(250)
+    logger.info("Menú DSSP listo para navegación a bandeja")
+
+    item_carne = root.locator(SEL["menu_item_carne"]).first
+    item_carne.wait_for(state="visible", timeout=8000)
+    item_carne.click(timeout=8000)
+
+    item_bandeja = root.locator(SEL["menu_item_bandeja_emision_onclick"]).first
+    try:
+        item_bandeja.wait_for(state="visible", timeout=4000)
+    except Exception:
+        item_carne.click(timeout=8000)
+        try:
+            item_bandeja.wait_for(state="visible", timeout=3500)
+        except Exception:
+            item_bandeja = root.locator(SEL["menu_item_bandeja_emision"]).first
+            item_bandeja.wait_for(state="visible", timeout=6000)
+
+    item_bandeja.click(timeout=10000)
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=10000)
+    except Exception:
+        pass
+    esperar_ajax_primefaces(page, timeout_ms=6000)
+    logger.info("Click en BANDEJA DE EMISIÓN ejecutado")
+
+
+def seleccionar_estado_bandeja(page, logger: logging.Logger, estado_objetivo: str = "CREADO") -> None:
+    """En Bandeja de Carnés selecciona Estado en el combo listForm:tipoFormacion."""
+    seleccionar_opcion_primefaces(
+        page,
+        trigger_selector=SEL["bandeja_estado_trigger"],
+        panel_selector=SEL["bandeja_estado_panel"],
+        label_selector=SEL["bandeja_estado_label"],
+        valor=estado_objetivo,
+        nombre_campo="Estado bandeja",
+    )
+    logger.info("[BANDEJA] Estado aplicado en filtro: %s", estado_objetivo)
+
+    try:
+        btn_buscar = page.locator(SEL["bandeja_buscar_button"]).first
+        btn_buscar.wait_for(state="visible", timeout=5000)
+        btn_buscar.click(timeout=7000)
+        esperar_ajax_primefaces(page, timeout_ms=9000)
+        page.wait_for_timeout(350)
+        logger.info("[BANDEJA] Búsqueda ejecutada con Estado=%s", estado_objetivo)
+    except Exception as exc:
+        raise Exception(f"No se pudo accionar Buscar en bandeja: {exc}")
+
+
+def seleccionar_todos_resultados_bandeja(page, logger: logging.Logger) -> None:
+    """Selecciona el checkbox de cabecera para marcar todos los registros de la tabla."""
+    tbody = page.locator(SEL["bandeja_resultados_tbody"]).first
+    tbody.wait_for(state="visible", timeout=8000)
+
+    # Si no hay filas, no hay nada que transmitir.
+    row_count = 0
+    try:
+        row_count = tbody.locator("tr").count()
+    except Exception:
+        row_count = 0
+    if row_count <= 0:
+        raise Exception("La tabla de resultados no tiene filas para seleccionar")
+
+    chk = page.locator(SEL["bandeja_select_all_checkbox"]).first
+    chk.wait_for(state="visible", timeout=7000)
+    cls = str(chk.get_attribute("class") or "")
+    if "ui-state-active" not in cls:
+        chk.click(timeout=7000)
+        esperar_ajax_primefaces(page, timeout_ms=5000)
+        page.wait_for_timeout(250)
+
+    cls_final = str(chk.get_attribute("class") or "")
+    if "ui-state-active" not in cls_final:
+        raise Exception("No se logró activar el checkbox de selección total")
+
+    logger.info("[BANDEJA] Checkbox de selección total activado")
+
+
+def transmitir_resultados_bandeja(page, logger: logging.Logger) -> None:
+    """Acciona el botón Transmitir en la bandeja luego de seleccionar registros."""
+    btn = page.locator(SEL["bandeja_transmitir_button"]).first
+    btn.wait_for(state="visible", timeout=9000)
+
+    try:
+        aria_disabled = str(btn.get_attribute("aria-disabled") or "").strip().lower()
+        if aria_disabled == "true":
+            raise Exception("Botón Transmitir deshabilitado")
+    except Exception as exc:
+        if "deshabilitado" in str(exc):
+            raise
+
+    btn.click(timeout=9000)
+    esperar_ajax_primefaces(page, timeout_ms=9000)
+    page.wait_for_timeout(400)
+    logger.info("[BANDEJA] Botón Transmitir accionado")
+
+
 def reintentar_busqueda_con_cambio_empresa(page, logger: logging.Logger, dni: str, max_wait_ms: int = 1200) -> None:
     """
     Sub-validación: si se detecta alerta que exige CAMBIO DE EMPRESA, cambia el tipo y rebusca.
@@ -3330,11 +3615,73 @@ def procesar_registro_cruce_en_formulario(page, logger: logging.Logger, item: di
         else:
             logger.warning("[FORM] [WARN] Unica secuencia fallo pero continuando para testing...")
 
+    # Paso 1: Guardar solicitud en la vista Crear Solicitud.
+    guardado_ok, guardado_msg = guardar_solicitud_creada(page, logger)
+    if not guardado_ok:
+        msg_guardar = guardado_msg or f"No se pudo accionar Guardar para DNI {dni}"
+        _registrar_error_tramite_en_comparacion(
+            logger,
+            compare_url,
+            compare_row_number,
+            compare_fieldnames,
+            msg_guardar,
+            fecha_hoy,
+        )
+        return False
+
+    # Paso 2: Actualizar Google Sheet (comparación) a estado post-guardar.
+    _registrar_estado_post_guardar_en_comparacion(
+        logger,
+        compare_url,
+        compare_row_number,
+        compare_fieldnames,
+        fecha_hoy,
+    )
+
+    # Paso 2.1: Marcar secuencia usada en tercera hoja (si aplica), antes de cambiar de vista.
+    try:
+        nombre_form = " ".join(
+            [
+                str(page.locator(SEL["crear_solicitud_ape_pat_input"]).first.input_value() or "").strip(),
+                str(page.locator(SEL["crear_solicitud_ape_mat_input"]).first.input_value() or "").strip(),
+                str(page.locator(SEL["crear_solicitud_nombres_input"]).first.input_value() or "").strip(),
+            ]
+        ).strip()
+    except Exception:
+        nombre_form = ""
+    _marcar_secuencia_usada_en_tercera_hoja(logger, item, dni, nombre_form)
+
+    # Paso 3: Ir a Bandeja de Carnés y filtrar por estado CREADO.
+    estado_bandeja_objetivo = str(os.getenv("CARNET_BANDEJA_ESTADO_OBJETIVO", "CREADO") or "CREADO").strip() or "CREADO"
+    try:
+        navegar_dssp_carne_bandeja_carnes(page, logger)
+        seleccionar_estado_bandeja(page, logger, estado_objetivo=estado_bandeja_objetivo)
+        seleccionar_todos_resultados_bandeja(page, logger)
+        transmitir_resultados_bandeja(page, logger)
+    except Exception as exc:
+        msg_bandeja = f"Solicitud guardada, pero falló navegación/filtro en Bandeja ({estado_bandeja_objetivo}): {exc}"
+        _registrar_error_tramite_en_comparacion(
+            logger,
+            compare_url,
+            compare_row_number,
+            compare_fieldnames,
+            msg_bandeja,
+            fecha_hoy,
+        )
+        return False
+
     # Actualizar hoja de comparación
     if compare_url and compare_row_number > 0:
         try:
+            estado_post = "TRANSMITIDO"
+            observacion_post = str(os.getenv("CARNET_OBSERVACION_POST_TRANSMITIR", "TRANSMITIDO EN BANDEJA") or "TRANSMITIDO EN BANDEJA").strip()
             _actualizar_fila_comparacion_por_row(logger, compare_url, compare_row_number,
-                {"observacion": "", "fecha_tramite": fecha_hoy},
+                {
+                    "observacion": observacion_post,
+                    "estado_tramite": estado_post,
+                    "responsable": "BOT CARNÉ SUCAMEC",
+                    "fecha_tramite": fecha_hoy,
+                },
                 fieldnames=compare_fieldnames,
             )
         except:
