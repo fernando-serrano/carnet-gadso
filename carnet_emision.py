@@ -291,6 +291,32 @@ def _truncate_log_if_exceeds_lines(log_file: Path, max_lines: int) -> bool:
     return False
 
 
+def _prune_log_files_by_count(log_dir: Path, keep_files: int, pattern: str = "*.log") -> int:
+    """Elimina logs más antiguos para mantener solo keep_files (nunca borra el más reciente)."""
+    try:
+        keep = max(1, int(keep_files or 1))
+    except Exception:
+        keep = 1
+
+    try:
+        archivos = [p for p in log_dir.glob(pattern) if p.is_file()]
+    except Exception:
+        return 0
+
+    if len(archivos) <= keep:
+        return 0
+
+    archivos.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    eliminados = 0
+    for viejo in archivos[keep:]:
+        try:
+            viejo.unlink(missing_ok=True)
+            eliminados += 1
+        except Exception:
+            continue
+    return eliminados
+
+
 def setup_logger(name: str = "carnet_emision", suffix: str = "") -> logging.Logger:
     ensure_directories()
     suffix_clean = f"_{suffix}" if suffix else ""
@@ -311,10 +337,16 @@ def setup_logger(name: str = "carnet_emision", suffix: str = "") -> logging.Logg
             log_file_name = "carnet_emision.log"
         log_file = LOGS_DIR / log_file_name
         was_truncated = _truncate_log_if_exceeds_lines(log_file, max_lines=max_lines)
+        pruned_logs = 0
     else:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         log_file = LOGS_DIR / f"{name}{suffix_clean}_{stamp}.log"
         was_truncated = False
+        try:
+            retention = int(str(os.getenv("CARNET_LOG_ROTATING_KEEP_FILES", "120") or "120").strip())
+        except Exception:
+            retention = 120
+        pruned_logs = _prune_log_files_by_count(LOGS_DIR, keep_files=max(1, retention), pattern=f"{name}{suffix_clean}_*.log")
 
     logger = logging.getLogger(f"{name}{suffix_clean}")
     logger.setLevel(logging.INFO)
@@ -332,8 +364,30 @@ def setup_logger(name: str = "carnet_emision", suffix: str = "") -> logging.Logg
 
     if was_truncated:
         logger.info("Log único truncado por umbral de líneas: %s (max=%s)", log_file, max_lines)
+    if pruned_logs > 0:
+        logger.info("Retención de logs aplicada: %s archivos antiguos eliminados", pruned_logs)
     logger.info("Log inicializado en %s", log_file)
     return logger
+
+
+def limpiar_cache_upload_tmp_por_dni(logger: logging.Logger, dni: str) -> None:
+    """Elimina cache temporal del DNI en data/cache/upload_tmp luego de éxito final."""
+    if not _as_bool_env("CARNET_CACHE_CLEAN_ON_SUCCESS", default=True):
+        return
+
+    dni_digits = "".join(ch for ch in str(dni or "") if ch.isdigit())
+    if not dni_digits:
+        return
+
+    target = DATA_DIR / "cache" / "upload_tmp" / dni_digits
+    if not target.exists() or not target.is_dir():
+        return
+
+    try:
+        shutil.rmtree(target)
+        logger.info("[CACHE] Limpiado upload_tmp para DNI=%s | path=%s", dni_digits, target)
+    except Exception as exc:
+        logger.warning("[CACHE] No se pudo limpiar upload_tmp para DNI=%s: %s", dni_digits, exc)
 
 
 def _as_bool_env(name: str, default: bool = False) -> bool:
@@ -3638,6 +3692,19 @@ def procesar_registro_cruce_en_formulario(page, logger: logging.Logger, item: di
         else:
             logger.warning("[FORM] [WARN] Unica secuencia fallo pero continuando para testing...")
 
+    # Capturar el nombre completo antes de Guardar para evitar leer el DOM cuando la vista ya redirige.
+    try:
+        nombre_form = " ".join(
+            [
+                str(page.locator(SEL["crear_solicitud_ape_pat_input"]).first.input_value() or "").strip(),
+                str(page.locator(SEL["crear_solicitud_ape_mat_input"]).first.input_value() or "").strip(),
+                str(page.locator(SEL["crear_solicitud_nombres_input"]).first.input_value() or "").strip(),
+            ]
+        ).strip()
+    except Exception:
+        nombre_form = ""
+    item["nombre_formulario"] = nombre_form
+
     # Paso 1: Guardar solicitud en la vista Crear Solicitud.
     guardado_ok, guardado_msg = guardar_solicitud_creada(page, logger)
     if not guardado_ok:
@@ -3662,16 +3729,7 @@ def procesar_registro_cruce_en_formulario(page, logger: logging.Logger, item: di
     )
 
     # Paso 2.1: Marcar secuencia usada en tercera hoja (si aplica), antes de cambiar de vista.
-    try:
-        nombre_form = " ".join(
-            [
-                str(page.locator(SEL["crear_solicitud_ape_pat_input"]).first.input_value() or "").strip(),
-                str(page.locator(SEL["crear_solicitud_ape_mat_input"]).first.input_value() or "").strip(),
-                str(page.locator(SEL["crear_solicitud_nombres_input"]).first.input_value() or "").strip(),
-            ]
-        ).strip()
-    except Exception:
-        nombre_form = ""
+    nombre_form = str(item.get("nombre_formulario", "") or "").strip()
     _marcar_secuencia_usada_en_tercera_hoja(logger, item, dni, nombre_form)
 
     # Paso 3: Ir a Bandeja de Carnés y filtrar por estado CREADO.
@@ -3709,6 +3767,9 @@ def procesar_registro_cruce_en_formulario(page, logger: logging.Logger, item: di
             )
         except:
             pass
+
+    # Limpieza de temporales locales de upload solo cuando el flujo llegó a TRANSMITIDO.
+    limpiar_cache_upload_tmp_por_dni(logger, dni)
 
     logger.info("[FORM] [OK] REGISTRO COMPLETADO EXITOSAMENTE")
     return True
