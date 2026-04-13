@@ -112,6 +112,8 @@ SEL = {
     "bandeja_resultados_tbody": "#listForm\\:dtResultados_data",
     "bandeja_select_all_checkbox": "#listForm\\:dtResultados .ui-chkbox-all .ui-chkbox-box, #listForm\\:dtResultados_head .ui-chkbox-all .ui-chkbox-box",
     "bandeja_transmitir_button": '#listForm\\:j_idt67, button[id*="listForm"][id*="j_idt67"], button:has-text("Transmitir")',
+    "bandeja_transmitir_confirm_dialog": "#dlgCompletarProceso",
+    "bandeja_transmitir_confirm_button": '#frmCompletarProceso\\:j_idt418, #dlgCompletarProceso button#frmCompletarProceso\\:j_idt418, #dlgCompletarProceso button:has(span.ui-button-text:text-is("Transmitir"))',
 }
 
 SUCCESS_SELECTORS = [
@@ -2979,7 +2981,28 @@ def transmitir_resultados_bandeja(page, logger: logging.Logger) -> None:
     btn.click(timeout=9000)
     esperar_ajax_primefaces(page, timeout_ms=9000)
     page.wait_for_timeout(400)
-    logger.info("[BANDEJA] Botón Transmitir accionado")
+
+    # Confirmación final en modal "Transmisión de registros".
+    dlg = page.locator(SEL["bandeja_transmitir_confirm_dialog"]).first
+    dlg.wait_for(state="visible", timeout=9000)
+
+    btn_confirmar = page.locator(SEL["bandeja_transmitir_confirm_button"]).first
+    btn_confirmar.wait_for(state="visible", timeout=7000)
+
+    aria_disabled_confirm = str(btn_confirmar.get_attribute("aria-disabled") or "").strip().lower()
+    if aria_disabled_confirm == "true":
+        raise Exception("Botón de confirmación Transmitir en modal está deshabilitado")
+
+    btn_confirmar.click(timeout=9000)
+    esperar_ajax_primefaces(page, timeout_ms=12000)
+    page.wait_for_timeout(450)
+
+    try:
+        dlg.wait_for(state="hidden", timeout=6000)
+    except Exception:
+        logger.warning("[BANDEJA] El diálogo de confirmación no se ocultó a tiempo tras confirmar transmisión")
+
+    logger.info("[BANDEJA] Transmisión confirmada en modal")
 
 
 def reintentar_busqueda_con_cambio_empresa(page, logger: logging.Logger, dni: str, max_wait_ms: int = 1200) -> None:
@@ -3674,7 +3697,7 @@ def procesar_registro_cruce_en_formulario(page, logger: logging.Logger, item: di
     if compare_url and compare_row_number > 0:
         try:
             estado_post = "TRANSMITIDO"
-            observacion_post = str(os.getenv("CARNET_OBSERVACION_POST_TRANSMITIR", "TRANSMITIDO EN BANDEJA") or "TRANSMITIDO EN BANDEJA").strip()
+            observacion_post = str(os.getenv("CARNET_OBSERVACION_POST_TRANSMITIR", "Transmitido sin observaciones") or "Transmitido sin observaciones").strip()
             _actualizar_fila_comparacion_por_row(logger, compare_url, compare_row_number,
                 {
                     "observacion": observacion_post,
