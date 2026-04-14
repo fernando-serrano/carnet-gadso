@@ -2923,6 +2923,72 @@ def detectar_error_tramite_observado(page, max_wait_ms: int = 4500, min_ts_ms: i
         page.wait_for_timeout(120)
 
 
+def detectar_error_tramite_transmitido(page, max_wait_ms: int = 4500, min_ts_ms: int | None = None) -> tuple[bool, str]:
+    """
+    Detecta alerta de SUCAMEC cuando el personal ya tiene registro en
+    la misma modalidad en estado TRANSMITIDO.
+    """
+    deadline = time.time() + (max(0, int(max_wait_ms)) / 1000.0)
+
+    def _es_mensaje_objetivo(texto: str) -> bool:
+        t = _normalizar_columna(texto)
+        if not t:
+            return False
+        return (
+            "misma modalidad" in t
+            and "estado transmitido" in t
+            and "personal de seguridad" in t
+        )
+
+    while True:
+        # 1. Buffer JS
+        try:
+            buffer = obtener_buffer_carnet_growl(page) or []
+            for msg_dict in buffer:
+                if min_ts_ms is not None:
+                    try:
+                        ts = int(msg_dict.get("ts", 0) or 0)
+                        if ts and ts < int(min_ts_ms):
+                            continue
+                    except Exception:
+                        pass
+                texto = str(msg_dict.get("text", "") or "").strip()
+                if _es_mensaje_objetivo(texto):
+                    return True, texto
+        except Exception:
+            pass
+
+        # 2. DOM actual
+        for selector in [
+            ".ui-growl-item .ui-growl-title",
+            ".ui-growl-item .ui-growl-message",
+            "#mensajesGrowl_container .ui-growl-title",
+            "#mensajesGrowl_container .ui-growl-message",
+        ]:
+            try:
+                loc = page.locator(selector)
+                total = min(loc.count(), 8)
+                for i in range(total):
+                    texto = (loc.nth(i).text_content() or "").strip()
+                    if _es_mensaje_objetivo(texto):
+                        return True, texto
+            except Exception:
+                pass
+
+        # 3. HTML completo
+        try:
+            html = (page.content() or "")
+            if _es_mensaje_objetivo(html):
+                return True, "Este personal de seguridad cuenta con un registro en la misma modalidad en estado TRANSMITIDO"
+        except Exception:
+            pass
+
+        if time.time() >= deadline:
+            return False, ""
+
+        page.wait_for_timeout(120)
+
+
 def detectar_error_curso_no_vigente(page, max_wait_ms: int = 4500, min_ts_ms: int | None = None) -> tuple[bool, str]:
     """
     Detecta alerta de SUCAMEC cuando el prospecto no cuenta con curso vigente.
@@ -3109,6 +3175,7 @@ def _registrar_error_tramite_en_comparacion(
         return
 
     try:
+        _, _, worker_tag = _worker_identity()
         _actualizar_fila_comparacion_por_row(
             logger,
             compare_url,
@@ -3118,7 +3185,7 @@ def _registrar_error_tramite_en_comparacion(
                 "observación": mensaje,
                 "estado_tramite": "ERROR EN TRAMITE",
                 "estado tramite": "ERROR EN TRAMITE",
-                "responsable": "BOT CARNÉ SUCAMEC",
+                "responsable": f"BOT CARNÉ SUCAMEC {worker_tag}",
                 "fecha tramite": str(fecha_tramite or "").strip(),
                 "fecha_tramite": str(fecha_tramite or "").strip(),
             },
@@ -3775,6 +3842,31 @@ def procesar_registro_cruce_en_formulario(page, logger: logging.Logger, item: di
 
     # Si aparece carné cesado, esta rutina cambia a CAMBIO DE EMPRESA y reintenta Buscar.
     reintentar_busqueda_con_cambio_empresa(page, logger, dni_limpio, max_wait_ms=post_search_wait_ms)
+
+    # Validación adicional: ya existe registro en la misma modalidad en estado TRANSMITIDO.
+    transmitido, msg_transmitido = detectar_error_tramite_transmitido(
+        page,
+        max_wait_ms=post_search_wait_ms,
+        min_ts_ms=ts_busqueda_ms,
+    )
+    if transmitido:
+        msg_tramite = (
+            msg_transmitido.strip()
+            if str(msg_transmitido or "").strip()
+            else "Este personal de seguridad cuenta con un registro en la misma modalidad en estado TRANSMITIDO"
+        )
+        logger.warning("[FORM] [ERROR_TRAMITE] %s", msg_tramite)
+
+        _registrar_error_tramite_en_comparacion(
+            logger,
+            compare_url,
+            compare_row_number,
+            compare_fieldnames,
+            msg_tramite,
+            fecha_hoy,
+        )
+
+        return False
 
     # Validacion pendiente 1/3: registro en misma modalidad en estado OBSERVADO.
     observado, msg_observado = detectar_error_tramite_observado(page, max_wait_ms=post_search_wait_ms, min_ts_ms=ts_busqueda_ms)
