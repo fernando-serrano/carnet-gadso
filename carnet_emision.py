@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 import logging
+from http.client import IncompleteRead
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 import unicodedata
@@ -26,7 +27,17 @@ from playwright.sync_api import sync_playwright
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent
-LOGS_DIR = BASE_DIR / "logs"
+
+
+def _resolve_dir_from_env(env_name: str, default_dir: Path) -> Path:
+    raw = str(os.getenv(env_name, "") or "").strip()
+    if not raw:
+        return default_dir
+    p = Path(raw)
+    return p if p.is_absolute() else (BASE_DIR / p)
+
+
+LOGS_DIR = _resolve_dir_from_env("LOG_DIR", BASE_DIR / "logs")
 DATA_DIR = BASE_DIR / "data"
 TEST_DIR = BASE_DIR / "test"
 CACHE_DIR = BASE_DIR / "__pycache__"
@@ -905,12 +916,38 @@ def imprimir_muestra_google_sheet_desde_url(
 def _leer_google_sheet_rows(sheet_url: str, logger: logging.Logger) -> tuple[list, list]:
     """Lee una hoja de Google Sheets por CSV y devuelve (rows, fieldnames)."""
     csv_url = _build_google_sheet_csv_url(sheet_url)
-    req = Request(
-        csv_url,
-        headers={"User-Agent": "Mozilla/5.0 (compatible; carnet-emision-bot/1.0)"},
-    )
-    with urlopen(req, timeout=25) as resp:
-        content = resp.read()
+    max_retries = max(1, _safe_int_env("CARNET_GSHEET_READ_RETRIES", 4))
+    timeout_sec = max(8, _safe_int_env("CARNET_GSHEET_TIMEOUT_SEC", 25))
+    retry_base_ms = max(200, _safe_int_env("CARNET_GSHEET_RETRY_BASE_MS", 600))
+
+    content = b""
+    last_exc = None
+    for intento in range(1, max_retries + 1):
+        try:
+            req = Request(
+                csv_url,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; carnet-emision-bot/1.0)"},
+            )
+            with urlopen(req, timeout=timeout_sec) as resp:
+                content = resp.read()
+            last_exc = None
+            break
+        except (IncompleteRead, TimeoutError, OSError) as exc:
+            last_exc = exc
+            if intento >= max_retries:
+                break
+            wait_ms = min(8000, retry_base_ms * (2 ** (intento - 1)))
+            logger.warning(
+                "[GSHEET] Lectura incompleta/interrumpida (intento %s/%s): %s. Reintento en %.1fs",
+                intento,
+                max_retries,
+                exc,
+                wait_ms / 1000.0,
+            )
+            time.sleep(wait_ms / 1000.0)
+
+    if last_exc is not None:
+        raise last_exc
 
     text = content.decode("utf-8-sig", errors="replace")
     reader = csv.DictReader(io.StringIO(text))
@@ -1056,6 +1093,72 @@ def _estado_comparacion_es_objetivo(estado: str, estados_objetivo: set[str], per
     return valor in estados_objetivo
 
 
+def _extraer_timestamp_desde_estado_reserva(estado_raw: str) -> int | None:
+    texto = str(estado_raw or "").strip()
+    if not texto:
+        return None
+
+    m = re.search(r"(?:TS=)(\d{10,13})", texto, flags=re.IGNORECASE)
+    if not m:
+        m = re.search(r"\b(\d{10,13})\b", texto)
+    if not m:
+        return None
+
+    try:
+        ts_val = int(m.group(1))
+    except Exception:
+        return None
+
+    if ts_val > 10**12:
+        ts_val = ts_val // 1000
+    return ts_val if ts_val > 0 else None
+
+
+def _estado_reserva_expirada(estado_raw: str, lease_minutes: int = 120) -> bool:
+    estado_norm = _normalizar_columna(estado_raw)
+    if not estado_norm:
+        return False
+
+    prefijos = (
+        "en_proceso|",
+        "en proceso|",
+        "reservado|",
+        "reserva|",
+    )
+    if not any(estado_norm.startswith(p) for p in prefijos):
+        return False
+
+    ts_estado = _extraer_timestamp_desde_estado_reserva(estado_raw)
+    if ts_estado is None:
+        return True
+
+    lease_seg = max(60, int(lease_minutes or 120) * 60)
+    return int(time.time()) - ts_estado > lease_seg
+
+
+def _worker_identity() -> tuple[str, str, str]:
+    worker_id = str(os.getenv("WORKER_ID", "main") or "main").strip() or "main"
+    run_id = str(os.getenv("WORKER_RUN_ID", "") or "").strip()
+    if not run_id:
+        run_id = datetime.now().strftime("%Y%m%d%H%M%S")
+    worker_tag = f"W{worker_id}"
+    return worker_id, run_id, worker_tag
+
+
+def _token_estado_en_proceso(dni: str) -> str:
+    worker_id, run_id, _ = _worker_identity()
+    ts = int(time.time())
+    dni_txt = str(dni or "").strip()
+    return f"EN_PROCESO|RUN={run_id}|W={worker_id}|DNI={dni_txt}|TS={ts}"
+
+
+def _token_estado_secuencia_reservada(dni: str) -> str:
+    worker_id, run_id, _ = _worker_identity()
+    ts = int(time.time())
+    dni_txt = str(dni or "").strip()
+    return f"RESERVADO|RUN={run_id}|W={worker_id}|DNI={dni_txt}|TS={ts}"
+
+
 def _parse_fecha_texto(valor: str) -> datetime | None:
     texto = str(valor or "").strip()
     if not texto:
@@ -1178,7 +1281,12 @@ def _seleccionar_fila_base_por_dni(rows_base: list[dict], fields_base: list[str]
     return mejor
 
 
-def _cargar_cruce_pendiente_desde_hojas(logger: logging.Logger, max_rows: int = 1) -> list[dict]:
+def _cargar_cruce_pendiente_desde_hojas(
+    logger: logging.Logger,
+    max_rows: int = 1,
+    preasignar_secuencias: bool = True,
+    permitir_en_proceso_expirado: bool = False,
+) -> list[dict]:
     url_base = str(os.getenv("CARNET_GSHEET_URL", DEFAULT_GSHEET_URL) or DEFAULT_GSHEET_URL).strip()
     url_compare = str(os.getenv("CARNET_GSHEET_COMPARE_URL", DEFAULT_GSHEET_COMPARE_URL) or "").strip()
     url_third = str(os.getenv("CARNET_GSHEET_THIRD_URL", DEFAULT_GSHEET_THIRD_URL) or "").strip()
@@ -1204,6 +1312,7 @@ def _cargar_cruce_pendiente_desde_hojas(logger: logging.Logger, max_rows: int = 
     col_base_puesto = _resolver_columna(fields_base, ["puesto"])
     col_cmp_dni = _resolver_columna(fields_compare, ["dni"])
     col_cmp_estado = _resolver_columna(fields_compare, ["estado_tramite"])
+    col_cmp_compania = _resolver_columna(fields_compare, ["compania", "compañia", "empresa"])
     col_cmp_obs = _resolver_columna(fields_compare, ["observacion"])
     col_cmp_fecha = _resolver_columna(fields_compare, ["fecha tramite"])
     col_third_dni = _resolver_columna(fields_third, ["dni"])
@@ -1270,10 +1379,13 @@ def _cargar_cruce_pendiente_desde_hojas(logger: logging.Logger, max_rows: int = 
     if not estados_objetivo:
         estados_objetivo = {"pendiente"}
     permitir_estado_vacio = _as_bool_env("CARNET_COMPARE_ALLOW_EMPTY_ESTADO", default=True)
+    lease_min_compare = max(5, _safe_int_env("CARNET_COMPARE_RESERVA_LEASE_MINUTES", 120))
     logger.info(
-        "[CRUCE] Criterio ESTADO: objetivos=%s | permitir_vacio=%s",
+        "[CRUCE] Criterio ESTADO: objetivos=%s | permitir_vacio=%s | permitir_en_proceso_expirado=%s | lease_min=%s",
         sorted(estados_objetivo),
         permitir_estado_vacio,
+        permitir_en_proceso_expirado,
+        lease_min_compare,
     )
 
     pendientes = []
@@ -1284,12 +1396,17 @@ def _cargar_cruce_pendiente_desde_hojas(logger: logging.Logger, max_rows: int = 
     for idx, row in enumerate(rows_compare, start=2):
         dni = str(row.get(col_cmp_dni, "") or "").strip()
         estado = str(row.get(col_cmp_estado, "") or "").strip() if col_cmp_estado else ""
+        compania = str(row.get(col_cmp_compania, "") or "").strip() if col_cmp_compania else ""
         
         if not dni:
             registros_saltados_sin_dni += 1
             continue
         
-        if not _estado_comparacion_es_objetivo(estado, estados_objetivo, permitir_estado_vacio):
+        estado_objetivo = _estado_comparacion_es_objetivo(estado, estados_objetivo, permitir_estado_vacio)
+        if not estado_objetivo and permitir_en_proceso_expirado:
+            estado_objetivo = _estado_reserva_expirada(estado, lease_minutes=lease_min_compare)
+
+        if not estado_objetivo:
             registros_saltados_estado_fuera_criterio += 1
             logger.debug("[CRUCE] Fila %s saltada: DNI=%s tiene ESTADO='%s' (fuera de criterio)", idx, dni, estado)
             continue
@@ -1304,15 +1421,23 @@ def _cargar_cruce_pendiente_desde_hojas(logger: logging.Logger, max_rows: int = 
         sede, origen_sede = resolver_sede_atencion_desde_departamento(departamento)
         modalidad_objetivo, modalidad_origen = resolver_modalidad_desde_puesto(puesto)
         tipo_doc_objetivo, dni_normalizado_tipo_doc, tipo_doc_origen = resolver_tipo_documento_desde_dni(dni)
-        comprobante_libre = terceros_libres[indice_comprobante_libre] if indice_comprobante_libre < len(terceros_libres) else None
-        copia_secuencia_pago_raw = str(comprobante_libre.get("copia_secuencia_pago_raw", "") or "").strip() if comprobante_libre else ""
-        copia_secuencia_pago = str(comprobante_libre.get("copia_secuencia_pago", "") or "").strip() if comprobante_libre else ""
-        estado_secuencia_pago = str(comprobante_libre.get("estado_secuencia_pago", "") or "").strip() if comprobante_libre else ""
-        tercera_row_number = int(comprobante_libre.get("row_number", 0) or 0) if comprobante_libre else 0
-        nro_secuencia_objetivo = copia_secuencia_pago
-        nro_secuencia_origen = "tercera_hoja:libre" if copia_secuencia_pago else "tercera_hoja:no_disponible"
-        if copia_secuencia_pago:
-            indice_comprobante_libre += 1
+        comprobante_libre = None
+        copia_secuencia_pago_raw = ""
+        copia_secuencia_pago = ""
+        estado_secuencia_pago = ""
+        tercera_row_number = 0
+        nro_secuencia_objetivo = ""
+        nro_secuencia_origen = "tercera_hoja:no_preasignada"
+        if preasignar_secuencias:
+            comprobante_libre = terceros_libres[indice_comprobante_libre] if indice_comprobante_libre < len(terceros_libres) else None
+            copia_secuencia_pago_raw = str(comprobante_libre.get("copia_secuencia_pago_raw", "") or "").strip() if comprobante_libre else ""
+            copia_secuencia_pago = str(comprobante_libre.get("copia_secuencia_pago", "") or "").strip() if comprobante_libre else ""
+            estado_secuencia_pago = str(comprobante_libre.get("estado_secuencia_pago", "") or "").strip() if comprobante_libre else ""
+            tercera_row_number = int(comprobante_libre.get("row_number", 0) or 0) if comprobante_libre else 0
+            nro_secuencia_objetivo = copia_secuencia_pago
+            nro_secuencia_origen = "tercera_hoja:libre" if copia_secuencia_pago else "tercera_hoja:no_disponible"
+            if copia_secuencia_pago:
+                indice_comprobante_libre += 1
 
         if base_row:
             logger.info(
@@ -1349,6 +1474,7 @@ def _cargar_cruce_pendiente_desde_hojas(logger: logging.Logger, max_rows: int = 
                 "compare_url": url_compare,
                 "dni": dni,
                 "estado": estado,
+                "compania": compania,
                 "base_row": base_row,
                 "base_row_number": base_row_number,
                 "base_fecha_cercana": base_fecha_cercana.strftime("%d/%m/%Y") if base_fecha_cercana else "",
@@ -1393,6 +1519,238 @@ def _cargar_cruce_pendiente_desde_hojas(logger: logging.Logger, max_rows: int = 
     )
 
     return pendientes
+
+
+def _intentar_reservar_registro_compare(logger: logging.Logger, item: dict) -> bool:
+    compare_url = str(item.get("compare_url", "") or "").strip()
+    compare_row_number = int(item.get("compare_row_number", 0) or item.get("row_number", 0) or 0)
+    compare_fieldnames = item.get("fieldnames_compare", []) or []
+    dni = str(item.get("dni", "") or "").strip()
+    if not compare_url or compare_row_number <= 0:
+        return False
+
+    token = _token_estado_en_proceso(dni)
+    _, _, worker_tag = _worker_identity()
+    fecha_hoy = datetime.now().strftime("%d/%m/%Y")
+
+    try:
+        _actualizar_fila_comparacion_por_row(
+            logger,
+            compare_url,
+            compare_row_number,
+            {
+                "estado_tramite": token,
+                "estado tramite": token,
+                "responsable": f"BOT CARNÉ SUCAMEC {worker_tag}",
+                "fecha tramite": fecha_hoy,
+                "fecha_tramite": fecha_hoy,
+            },
+            fieldnames=compare_fieldnames,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[WORKER][RESERVA] No se pudo escribir reserva en comparación fila=%s DNI=%s: %s",
+            compare_row_number,
+            dni,
+            exc,
+        )
+        return False
+
+    try:
+        rows_cmp, fields_cmp = _leer_google_sheet_rows(compare_url, logger)
+    except Exception as exc:
+        logger.warning("[WORKER][RESERVA] No se pudo verificar reserva en comparación: %s", exc)
+        return False
+
+    idx = compare_row_number - 2
+    if idx < 0 or idx >= len(rows_cmp):
+        return False
+
+    col_estado = _resolver_columna(fields_cmp, ["estado_tramite", "estado tramite"])
+    if not col_estado:
+        logger.warning("[WORKER][RESERVA] No se resolvió ESTADO_TRAMITE para verificación")
+        return False
+
+    estado_actual = str(rows_cmp[idx].get(col_estado, "") or "").strip()
+    if estado_actual != token:
+        return False
+
+    item["compare_reserva_token"] = token
+    item["compare_reservado_por"] = worker_tag
+    return True
+
+
+def _reservar_siguiente_item_para_worker(logger: logging.Logger) -> dict | None:
+    max_scan = max(8, _safe_int_env("CARNET_WORKER_SCAN_ROWS", 200))
+    permitir_stale = _as_bool_env("CARNET_COMPARE_ALLOW_STALE_IN_PROGRESS", default=True)
+
+    candidatos = _cargar_cruce_pendiente_desde_hojas(
+        logger,
+        max_rows=max_scan,
+        preasignar_secuencias=False,
+        permitir_en_proceso_expirado=permitir_stale,
+    )
+    if not candidatos:
+        return None
+
+    for item in candidatos:
+        if _intentar_reservar_registro_compare(logger, item):
+            return item
+    return None
+
+
+def _reservar_siguiente_secuencia_para_worker(
+    logger: logging.Logger,
+    item: dict,
+    dni: str,
+    filas_excluidas: set[int] | None = None,
+) -> dict | None:
+    tercera_url = str(item.get("tercera_url", "") or os.getenv("CARNET_GSHEET_THIRD_URL", DEFAULT_GSHEET_THIRD_URL) or "").strip()
+    if not tercera_url:
+        return None
+
+    filas_excluidas = filas_excluidas or set()
+    lease_min = max(5, _safe_int_env("CARNET_TERCERA_RESERVA_LEASE_MINUTES", 120))
+
+    rows_third, fields_third = _leer_google_sheet_rows(tercera_url, logger)
+    col_third_dni = _resolver_columna(fields_third, ["dni"])
+    col_third_copia = _resolver_columna(
+        fields_third,
+        ["copia de secuencia de pago", "copia secuencia de pago", "secuencia de pago"],
+    )
+    col_third_estado = _resolver_columna(
+        fields_third,
+        ["estado secuencia de pago", "estado secuencia pago", "estado_secuencia_pago", "estado secuencia"],
+    )
+
+    if not col_third_copia or not col_third_estado:
+        logger.warning("[WORKER][SECUENCIA] Columnas de tercera hoja no resueltas para reserva")
+        return None
+
+    for row_number, row in enumerate(rows_third, start=2):
+        if row_number in filas_excluidas:
+            continue
+
+        copia_raw = str(row.get(col_third_copia, "") or "").strip()
+        if not copia_raw:
+            continue
+
+        estado_raw = str(row.get(col_third_estado, "") or "").strip()
+        estado_norm = _normalizar_columna(estado_raw)
+        reserva_expirada = _estado_reserva_expirada(estado_raw, lease_minutes=lease_min)
+        if estado_norm == "usado":
+            continue
+
+        if estado_norm and not reserva_expirada:
+            continue
+
+        dni_actual = str(row.get(col_third_dni, "") or "").strip() if col_third_dni else ""
+        if dni_actual and (not reserva_expirada) and estado_norm != "no encontrado":
+            continue
+
+        token = _token_estado_secuencia_reservada(dni)
+        updates = {col_third_estado: token}
+        if col_third_dni:
+            updates[col_third_dni] = str(dni or "").strip()
+
+        try:
+            _actualizar_fila_tercera_hoja_por_row(
+                logger,
+                tercera_url,
+                row_number,
+                updates,
+                fieldnames=fields_third,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[WORKER][SECUENCIA] No se pudo reservar fila=%s secuencia=%s: %s",
+                row_number,
+                copia_raw,
+                exc,
+            )
+            continue
+
+        try:
+            rows_verify, fields_verify = _leer_google_sheet_rows(tercera_url, logger)
+        except Exception as exc:
+            logger.warning("[WORKER][SECUENCIA] No se pudo verificar reserva de secuencia: %s", exc)
+            continue
+
+        idx = row_number - 2
+        if idx < 0 or idx >= len(rows_verify):
+            continue
+        col_estado_verify = _resolver_columna(
+            fields_verify,
+            ["estado secuencia de pago", "estado secuencia pago", "estado_secuencia_pago", "estado secuencia"],
+        )
+        if not col_estado_verify:
+            continue
+
+        estado_verify = str(rows_verify[idx].get(col_estado_verify, "") or "").strip()
+        if estado_verify != token:
+            continue
+
+        copia_norm = normalizar_copia_secuencia_pago(copia_raw)
+        item["tercera_url"] = tercera_url
+        item["fieldnames_third"] = fields_verify
+        item["col_third_estado_sec"] = col_estado_verify
+        item["col_third_dni"] = _resolver_columna(fields_verify, ["dni"])
+        item["col_third_solicitado_por"] = _resolver_columna(fields_verify, ["solicitado por", "solicitado_por", "solicitadopor"])
+        item["col_third_apellidos_nombre"] = _resolver_columna(
+            fields_verify,
+            ["apellidos y nombre", "apellido y nombre", "apellidos nombres", "apellidos y nombres", "apellidos_nombre"],
+        )
+        item["tercera_row_number"] = row_number
+        item["copia_secuencia_pago_raw"] = copia_raw
+        item["copia_secuencia_pago"] = copia_norm
+        item["nro_secuencia_objetivo"] = copia_norm
+        item["nro_secuencia_origen"] = "tercera_hoja:reservada_worker"
+        item["tercera_reserva_token"] = token
+        return {
+            "row_number": row_number,
+            "token": token,
+            "copia_secuencia_pago_raw": copia_raw,
+            "copia_secuencia_pago": copia_norm,
+        }
+
+    return None
+
+
+def _liberar_reserva_secuencia_si_aplica(logger: logging.Logger, item: dict) -> None:
+    tercera_url = str(item.get("tercera_url", "") or "").strip()
+    tercera_row = int(item.get("tercera_row_number", 0) or 0)
+    token = str(item.get("tercera_reserva_token", "") or "").strip()
+    third_fieldnames = item.get("fieldnames_third", []) or []
+    col_estado = item.get("col_third_estado_sec")
+    if not tercera_url or tercera_row <= 0 or not token or not col_estado:
+        return
+
+    try:
+        rows_third, fields_third = _leer_google_sheet_rows(tercera_url, logger)
+        idx = tercera_row - 2
+        if idx < 0 or idx >= len(rows_third):
+            return
+        col_estado_real = _resolver_columna(
+            fields_third,
+            ["estado secuencia de pago", "estado secuencia pago", "estado_secuencia_pago", "estado secuencia"],
+        )
+        if not col_estado_real:
+            return
+        estado_actual = str(rows_third[idx].get(col_estado_real, "") or "").strip()
+        if estado_actual != token:
+            return
+
+        _actualizar_fila_tercera_hoja_por_row(
+            logger,
+            tercera_url,
+            tercera_row,
+            {col_estado: ""},
+            fieldnames=third_fieldnames,
+        )
+        item["tercera_reserva_token"] = ""
+        logger.info("[WORKER][SECUENCIA] Reserva liberada en tercera hoja fila=%s", tercera_row)
+    except Exception as exc:
+        logger.warning("[WORKER][SECUENCIA] No se pudo liberar reserva de secuencia: %s", exc)
 
 
 def ejecutar_prueba_cruce_y_sede_en_formulario(page, logger: logging.Logger, max_rows: int = 1) -> None:
@@ -3590,50 +3948,46 @@ def procesar_registro_cruce_en_formulario(page, logger: logging.Logger, item: di
         )
         return False
 
-    # Loop de secuencias con fallback por "No se encontró el recibo".
-    secuencia_candidatos = item.get("terceros_libres", []) or []  # Usar terceros_libres del item
+    # Reserva de secuencias por worker para evitar colisiones entre hilos/procesos.
     tercera_url = str(item.get("tercera_url", "") or os.getenv("CARNET_GSHEET_THIRD_URL", DEFAULT_GSHEET_THIRD_URL) or "").strip()
-    third_fieldnames = item.get("fieldnames_third", []) or []
-    col_third_estado = item.get("col_third_estado_sec")
-    
-    # Si no hay candidatos, crear fallback con la secuencia actual del item
-    if not secuencia_candidatos:
-        nro_sec = str(item.get("nro_secuencia_objetivo", "") or item.get("copia_secuencia_pago", "") or "").strip()
-        if nro_sec:
-            secuencia_candidatos = [{
-                "copia_secuencia_pago": nro_sec,
-                "copia_secuencia_pago_raw": str(item.get("copia_secuencia_pago_raw", "") or "").strip(),
-                "row_number": item.get("tercera_row_number", 0),
-            }]
-        else:
-            logger.error("[FORM] Sin secuencia de comprobante disponible")
-            return False
-    
+    if not tercera_url:
+        logger.error("[FORM] No se configuró CARNET_GSHEET_THIRD_URL para reservar secuencia")
+        return False
+
     secuencia_exitosa = False
-    for intento_num, candidato in enumerate(secuencia_candidatos, 1):
-        nro_sec = str(candidato.get("copia_secuencia_pago", "") or "").strip()
-        nro_sec_raw = str(candidato.get("copia_secuencia_pago_raw", "") or "").strip()
-        tercera_row = int(candidato.get("row_number", 0) or 0)
-        
-        if not nro_sec:
-            logger.warning("[FORM] Candidato %s sin secuencia; saltando", intento_num)
-            continue
-        
+    filas_secuencia_probadas: set[int] = set()
+    max_intentos_secuencia = max(1, _safe_int_env("CARNET_MAX_SECUENCIA_INTENTOS", 40))
+    for intento_num in range(1, max_intentos_secuencia + 1):
+        reservado = _reservar_siguiente_secuencia_para_worker(
+            logger,
+            item,
+            dni,
+            filas_excluidas=filas_secuencia_probadas,
+        )
+        if not reservado:
+            logger.warning("[FORM] Sin secuencias libres/reservables para DNI=%s tras %s intentos", dni, intento_num - 1)
+            break
+
+        nro_sec = str(reservado.get("copia_secuencia_pago", "") or "").strip()
+        nro_sec_raw = str(reservado.get("copia_secuencia_pago_raw", "") or "").strip()
+        tercera_row = int(reservado.get("row_number", 0) or 0)
+        filas_secuencia_probadas.add(tercera_row)
+
         logger.info(
             "[FORM] Intento secuencia %s/%s: %s | TERCERA_FILA=%s",
             intento_num,
-            len(secuencia_candidatos),
+            max_intentos_secuencia,
             nro_sec,
             tercera_row if tercera_row > 0 else "N/A",
         )
         limpiar_buffer_carnet_growl(page)
         ts_intento_ms = int(time.time() * 1000)
         ingresar_copia_secuencia_pago(page, nro_sec)
-        
-        # Esperar AJAX y detectar resultado (AMBOS mensajes)
+
+        # Esperar AJAX y detectar resultado (AMBOS mensajes).
         page.wait_for_timeout(800)
-        resultado, msg = detectar_resultado_verificacion_comprobante(page, max_wait_ms=6000, min_ts_ms=ts_intento_ms)
-        
+        resultado, _msg = detectar_resultado_verificacion_comprobante(page, max_wait_ms=6000, min_ts_ms=ts_intento_ms)
+
         if resultado == "ENCONTRADO":
             logger.info(
                 "[FORM] [OK] SECUENCIA %s VALIDA EN SUCAMEC | TERCERA_FILA=%s",
@@ -3645,52 +3999,62 @@ def procesar_registro_cruce_en_formulario(page, logger: logging.Logger, item: di
             item["copia_secuencia_pago_raw"] = nro_sec_raw
             item["tercera_row_number"] = tercera_row
             break
-        elif resultado == "NO_ENCONTRADO":
+
+        if resultado == "NO_ENCONTRADO":
             logger.warning(
                 "[FORM] [ERROR] SECUENCIA %s NO ENCONTRADA EN SUCAMEC | TERCERA_FILA=%s",
                 nro_sec,
                 tercera_row if tercera_row > 0 else "N/A",
             )
-            # Marcar en tercera hoja si existe
-            if tercera_url and tercera_row > 0:
+            col_third_estado = item.get("col_third_estado_sec")
+            third_fieldnames = item.get("fieldnames_third", []) or []
+            if tercera_url and tercera_row > 0 and col_third_estado:
                 try:
-                    if col_third_estado:
-                        _actualizar_fila_tercera_hoja_por_row(logger, tercera_url, tercera_row,
-                            {col_third_estado: "NO ENCONTRADO"}, third_fieldnames)
-                        logger.info("[FORM] Fila %s marcada como NO ENCONTRADO en tercera hoja", tercera_row)
-                    else:
-                        logger.warning("[FORM] Columna 'Estado Secuencia de Pago' no resuelta; no se marca fila tercera=%s", tercera_row)
+                    _actualizar_fila_tercera_hoja_por_row(
+                        logger,
+                        tercera_url,
+                        tercera_row,
+                        {col_third_estado: "NO ENCONTRADO"},
+                        third_fieldnames,
+                    )
+                    item["tercera_reserva_token"] = ""
+                    logger.info("[FORM] Fila %s marcada como NO ENCONTRADO en tercera hoja", tercera_row)
                 except Exception as exc:
-                    logger.warning("[FORM] No se pudo marcar en tercera hoja: %s", exc)
-            # Limpiar campo para siguiente intento
+                    logger.warning("[FORM] No se pudo marcar NO ENCONTRADO en tercera hoja: %s", exc)
+                    _liberar_reserva_secuencia_si_aplica(logger, item)
+
             try:
                 limpiar_campo_copia_secuencia_pago(page)
             except Exception:
                 pass
-        else:  # TIMEOUT
-            logger.info("[FORM] [WARN] TIMEOUT en deteccion; asumiendo EXITO para %s", nro_sec)
-            secuencia_exitosa = True
-            item["copia_secuencia_pago"] = nro_sec
-            item["copia_secuencia_pago_raw"] = nro_sec_raw
-            item["tercera_row_number"] = tercera_row
-            break
-    
+            continue
+
+        # TIMEOUT: mantener criterio conservador histórico para no bloquear el flujo.
+        logger.info("[FORM] [WARN] TIMEOUT en detección; asumiendo EXITO para %s", nro_sec)
+        secuencia_exitosa = True
+        item["copia_secuencia_pago"] = nro_sec
+        item["copia_secuencia_pago_raw"] = nro_sec_raw
+        item["tercera_row_number"] = tercera_row
+        break
+
     if not secuencia_exitosa:
-        logger.error("[FORM] [FRACASO] Sin secuencia valida tras %s intentos", len(secuencia_candidatos))
-        # Si solo hay 1 candidato (fallback), continua igualmente para testing
-        # Si hay múltiples y todos fallan, retorna error
-        if len(secuencia_candidatos) > 1:
-            if compare_url and compare_row_number > 0:
-                try:
-                    _actualizar_fila_comparacion_por_row(logger, compare_url, compare_row_number,
-                        {"observacion": f"Sin secuencia valida tras {len(secuencia_candidatos)} intentos", "fecha_tramite": fecha_hoy},
-                        fieldnames=compare_fieldnames,
-                    )
-                except:
-                    pass
-            return False
-        else:
-            logger.warning("[FORM] [WARN] Unica secuencia fallo pero continuando para testing...")
+        logger.error("[FORM] [FRACASO] Sin secuencia valida tras %s intentos", max(1, len(filas_secuencia_probadas)))
+        if compare_url and compare_row_number > 0:
+            try:
+                _actualizar_fila_comparacion_por_row(
+                    logger,
+                    compare_url,
+                    compare_row_number,
+                    {
+                        "observacion": f"Sin secuencia valida tras {max(1, len(filas_secuencia_probadas))} intentos",
+                        "fecha_tramite": fecha_hoy,
+                    },
+                    fieldnames=compare_fieldnames,
+                )
+            except Exception:
+                pass
+        _liberar_reserva_secuencia_si_aplica(logger, item)
+        return False
 
     # Capturar el nombre completo antes de Guardar para evitar leer el DOM cuando la vista ya redirige.
     try:
@@ -3770,6 +4134,17 @@ def procesar_registro_cruce_en_formulario(page, logger: logging.Logger, item: di
 
     # Limpieza de temporales locales de upload solo cuando el flujo llegó a TRANSMITIDO.
     limpiar_cache_upload_tmp_por_dni(logger, dni)
+
+    # Requisito operativo: volver a CREAR SOLICITUD para iterar el siguiente registro.
+    try:
+        navegar_dssp_carne_crear_solicitud(page, logger)
+        vista_ok_post = validar_vista_crear_solicitud_por_ui(page, timeout_ms=3200)
+        if vista_ok_post:
+            logger.info("[FORM] Retorno a CREAR SOLICITUD confirmado para siguiente iteración")
+        else:
+            logger.warning("[FORM] Retorno a CREAR SOLICITUD no confirmado por validador, se reintentará en siguiente registro")
+    except Exception as exc:
+        logger.warning("[FORM] No se pudo retornar a CREAR SOLICITUD tras transmitir: %s", exc)
 
     logger.info("[FORM] [OK] REGISTRO COMPLETADO EXITOSAMENTE")
     return True
@@ -4408,7 +4783,7 @@ def esperar_ajax_primefaces(page, timeout_ms: int = 7000) -> None:
         pass
 
 
-def validar_vista_crear_solicitud_por_ui(page, timeout_ms: int = 3000) -> bool:
+def validar_vista_crear_solicitud_por_ui(page, timeout_ms: int = 6000) -> bool:
     """
     Confirma vista de CREAR SOLICITUD por UI (sin depender de URL).
     Soporta selector personalizado opcional vía CARNET_CREAR_SOLICITUD_SELECTOR.
@@ -4423,6 +4798,33 @@ def validar_vista_crear_solicitud_por_ui(page, timeout_ms: int = 3000) -> bool:
                     return True
             except Exception:
                 pass
+
+        # Señales fuertes por presencia de campos del formulario createForm.
+        try:
+            ok_fields = page.evaluate(
+                """() => {
+                    const sels = [
+                        'form#createForm',
+                        '#createForm\\:dondeRecoger_label',
+                        '#createForm\\:modalidad_label',
+                        '#createForm\\:tipoRegistro_label',
+                        '#createForm\\:tipoDoc_label',
+                        '#createForm\\:nroSecuencia',
+                        '#createForm\\:numDoc',
+                        '#createForm\\:btnBuscarVigilante',
+                    ];
+                    return sels.some((sel) => {
+                        const el = document.querySelector(sel);
+                        if (!el) return false;
+                        if (el.tagName === 'FORM') return true;
+                        return !!(el.offsetParent || (el.getClientRects && el.getClientRects().length));
+                    });
+                }"""
+            )
+            if bool(ok_fields):
+                return True
+        except Exception:
+            pass
 
         try:
             ok = page.evaluate(
@@ -4444,7 +4846,7 @@ def validar_vista_crear_solicitud_por_ui(page, timeout_ms: int = 3000) -> bool:
                     }
                     if (!root) return false;
                     const txt = String(root.innerText || '').replace(/\\s+/g, ' ').toUpperCase();
-                    return txt.includes('CREAR SOLICITUD');
+                    return txt.includes('CREAR SOLICITUD') || txt.includes('NRO. DE SECUENCIA') || txt.includes('TIPO DE DOCUMENTO');
                 }"""
             )
             if bool(ok):
@@ -4452,7 +4854,7 @@ def validar_vista_crear_solicitud_por_ui(page, timeout_ms: int = 3000) -> bool:
         except Exception:
             pass
 
-        page.wait_for_timeout(150)
+        page.wait_for_timeout(180)
 
     return False
 
@@ -4463,6 +4865,8 @@ def navegar_dssp_carne_crear_solicitud(page, logger: logging.Logger) -> None:
         page.wait_for_load_state("domcontentloaded", timeout=8000)
     except Exception:
         pass
+
+    validation_timeout_ms = max(2000, _safe_int_env("CARNET_CREAR_SOLICITUD_VALIDATION_TIMEOUT_MS", 6500))
 
     # Fast-path: click directo al link JSF de CREAR SOLICITUD por onclick.
     try:
@@ -4479,12 +4883,14 @@ def navegar_dssp_carne_crear_solicitud(page, logger: logging.Logger) -> None:
         if click_directo:
             logger.info("Fast-path: click directo en CREAR SOLICITUD (onclick JSF)")
             try:
-                page.wait_for_load_state("networkidle", timeout=7000)
+                page.wait_for_load_state("domcontentloaded", timeout=4500)
             except Exception:
                 pass
-            esperar_ajax_primefaces(page, timeout_ms=5000)
-            logger.info("Click JSF en CREAR SOLICITUD ejecutado (sin validación de vista por UI)")
-            return
+            esperar_ajax_primefaces(page, timeout_ms=3500)
+            if validar_vista_crear_solicitud_por_ui(page, timeout_ms=2200):
+                logger.info("Click JSF en CREAR SOLICITUD ejecutado (vista confirmada por UI)")
+                return
+            logger.warning("Fast-path no confirmó vista CREAR SOLICITUD; se intentará navegación jerárquica")
     except Exception:
         pass
 
@@ -4539,7 +4945,10 @@ def navegar_dssp_carne_crear_solicitud(page, logger: logging.Logger) -> None:
     except Exception:
         pass
     esperar_ajax_primefaces(page, timeout_ms=6000)
-    logger.info("Click en CREAR SOLICITUD ejecutado (sin validación de vista por UI)")
+    if validar_vista_crear_solicitud_por_ui(page, timeout_ms=validation_timeout_ms):
+        logger.info("Click en CREAR SOLICITUD ejecutado (vista confirmada por UI)")
+    else:
+        logger.warning("Click en CREAR SOLICITUD ejecutado, pero no se confirmó vista por UI")
 
 
 def preparar_flujo_emision_carnet(logger: logging.Logger, page, grupo: str, registro_formulario: dict | None = None) -> None:
@@ -4581,6 +4990,70 @@ def credenciales_por_grupo(grupo: str) -> dict:
     return CREDENCIALES_JV
 
 
+def _cerrar_paginas_extra_context(context, page_principal, logger: logging.Logger) -> None:
+    """Cierra páginas adicionales para mantener 1 pestaña activa por worker."""
+    try:
+        pages = list(context.pages)
+    except Exception:
+        return
+
+    for p in pages:
+        if p == page_principal:
+            continue
+        try:
+            p.close()
+            logger.info("[WORKER] Pestaña extra cerrada para evitar superposición de flujo")
+        except Exception:
+            pass
+
+
+def _abrir_sesion_grupo(playwright, logger: logging.Logger, grupo: str):
+    headless = _as_bool_env("CARNET_HEADLESS", default=False)
+    launch_args = _build_launch_args_for_window()
+    logger.info("[%s] Args Chromium: %s", grupo, " ".join(launch_args))
+
+    browser = playwright.chromium.launch(
+        headless=headless,
+        slow_mo=0,
+        args=launch_args,
+    )
+    context = browser.new_context(no_viewport=True, ignore_https_errors=True)
+    page = context.new_page()
+    return browser, context, page
+
+
+def _ejecutar_login_en_pagina(page, logger: logging.Logger, grupo: str) -> None:
+    credenciales = credenciales_por_grupo(grupo)
+    validar_credenciales_configuradas(credenciales, grupo)
+    login_validation_timeout_ms = max(1000, _safe_int_env("LOGIN_VALIDATION_TIMEOUT_MS", 12000))
+
+    logger.info("[%s] Navegando a login", grupo)
+    page.goto(URL_LOGIN, wait_until="domcontentloaded", timeout=45000)
+    esperar_hasta_servicio_disponible(page, URL_LOGIN, espera_segundos=8)
+
+    activar_pestana_autenticacion_tradicional(page)
+    page.locator(SEL["numero_documento"]).wait_for(state="visible", timeout=9000)
+
+    page.select_option(SEL["tipo_doc_select"], value=credenciales["tipo_documento_valor"])
+    page.wait_for_timeout(300)
+
+    escribir_input_rapido(page, SEL["numero_documento"], credenciales["numero_documento"])
+    escribir_input_rapido(page, SEL["usuario"], credenciales["usuario"])
+    escribir_input_rapido(page, SEL["clave"], credenciales["contrasena"])
+    logger.info("[%s] Credenciales cargadas", grupo)
+
+    captcha_text = solve_captcha_ocr(page, logger)
+    escribir_input_rapido(page, SEL["captcha_input"], captcha_text)
+    logger.info("[%s] Captcha escrito automáticamente", grupo)
+
+    page.locator(SEL["ingresar"]).click(timeout=10000)
+    ok, msg_error, tiempo = validar_resultado_login_por_ui(page, timeout_ms=login_validation_timeout_ms)
+    if not ok:
+        raise Exception(f"[{grupo}] Login fallido: {msg_error}")
+
+    logger.info("[%s] Login exitoso en %.2fs", grupo, tiempo)
+
+
 def ejecutar_login_grupo(
     playwright,
     logger: logging.Logger,
@@ -4588,12 +5061,8 @@ def ejecutar_login_grupo(
     registro_formulario: dict | None = None,
     keep_browser_open_on_finish: bool = False,
 ):
-    credenciales = credenciales_por_grupo(grupo)
-    validar_credenciales_configuradas(credenciales, grupo)
-
     hold_browser_open = _as_bool_env("HOLD_BROWSER_OPEN", default=False)
     headless = _as_bool_env("CARNET_HEADLESS", default=False)
-    login_validation_timeout_ms = max(1000, _safe_int_env("LOGIN_VALIDATION_TIMEOUT_MS", 12000))
     keep_open_now = bool(
         (keep_browser_open_on_finish or hold_browser_open)
         and (not _is_scheduled_mode())
@@ -4602,42 +5071,11 @@ def ejecutar_login_grupo(
 
     browser = None
     context = None
+    page = None
     try:
-        launch_args = _build_launch_args_for_window()
-        logger.info("[%s] Args Chromium: %s", grupo, " ".join(launch_args))
-        browser = playwright.chromium.launch(
-            headless=headless,
-            slow_mo=0,
-            args=launch_args,
-        )
-        context = browser.new_context(no_viewport=True, ignore_https_errors=True)
-        page = context.new_page()
-
-        logger.info("[%s] Navegando a login", grupo)
-        page.goto(URL_LOGIN, wait_until="domcontentloaded", timeout=45000)
-        esperar_hasta_servicio_disponible(page, URL_LOGIN, espera_segundos=8)
-
-        activar_pestana_autenticacion_tradicional(page)
-        page.locator(SEL["numero_documento"]).wait_for(state="visible", timeout=9000)
-
-        page.select_option(SEL["tipo_doc_select"], value=credenciales["tipo_documento_valor"])
-        page.wait_for_timeout(300)
-
-        escribir_input_rapido(page, SEL["numero_documento"], credenciales["numero_documento"])
-        escribir_input_rapido(page, SEL["usuario"], credenciales["usuario"])
-        escribir_input_rapido(page, SEL["clave"], credenciales["contrasena"])
-        logger.info("[%s] Credenciales cargadas", grupo)
-
-        captcha_text = solve_captcha_ocr(page, logger)
-        escribir_input_rapido(page, SEL["captcha_input"], captcha_text)
-        logger.info("[%s] Captcha escrito automáticamente", grupo)
-
-        page.locator(SEL["ingresar"]).click(timeout=10000)
-        ok, msg_error, tiempo = validar_resultado_login_por_ui(page, timeout_ms=login_validation_timeout_ms)
-        if not ok:
-            raise Exception(f"[{grupo}] Login fallido: {msg_error}")
-
-        logger.info("[%s] Login exitoso en %.2fs", grupo, tiempo)
+        browser, context, page = _abrir_sesion_grupo(playwright, logger, grupo)
+        _ejecutar_login_en_pagina(page, logger, grupo)
+        _cerrar_paginas_extra_context(context, page, logger)
         preparar_flujo_emision_carnet(logger, page, grupo, registro_formulario=registro_formulario)
 
         if keep_open_now:
@@ -4660,34 +5098,114 @@ def ejecutar_login_grupo(
             pass
 
 
-def _ejecutar_flujo_fila_por_fila(logger: logging.Logger, max_rows: int = 1) -> int:
-    """Procesa los registros pendientes uno por uno, sin agrupar por grupo."""
-    pendientes = _cargar_cruce_pendiente_desde_hojas(logger, max_rows=max_rows)
-    if not pendientes:
-        logger.warning("[CRUCE] No hay registros pendientes para procesar uno por uno")
-        return 0
+def _resolver_grupo_para_item(item: dict) -> str:
+    base_row = item.get("base_row") or {}
+    compania_compare = str(item.get("compania", "") or "").strip()
+    if compania_compare:
+        grupo_cmp = obtener_grupo_ruc(compania_compare)
+        if grupo_cmp in {"JV", "SELVA"}:
+            return grupo_cmp
 
+    grupo = obtener_grupo_ruc(
+        str(
+            base_row.get("ruc", "")
+            or compania_compare
+            or item.get("departamento", "")
+            or ""
+        )
+    )
+    if grupo == "OTRO":
+        grupo = obtener_grupo_ruc(str(base_row.get("compania", "") or item.get("compania", "") or "JV"))
+    if grupo == "OTRO":
+        grupo = "JV"
+    return grupo
+
+
+def _ejecutar_flujo_fila_por_fila(logger: logging.Logger, max_rows: int = 1) -> int:
+    """Procesa registros de comparación, con reserva dinámica cuando corre como worker."""
+    is_multiworker_child = _as_bool_env("MULTIWORKER_CHILD", default=False)
     max_login_retries_per_group = max(1, _safe_int_env("MAX_LOGIN_RETRIES_PER_GROUP", 12))
+    max_rows_int = int(max_rows or 0)
+
+    pendientes = []
+    if not is_multiworker_child:
+        pendientes = _cargar_cruce_pendiente_desde_hojas(
+            logger,
+            max_rows=max(1, max_rows_int or 1),
+            preasignar_secuencias=False,
+            permitir_en_proceso_expirado=False,
+        )
+        if not pendientes:
+            logger.warning("[CRUCE] No hay registros pendientes para procesar uno por uno")
+            return 0
 
     playwright = sync_playwright().start()
+    procesados = 0
+    browser = None
+    context = None
+    page = None
+    grupo_sesion_actual = ""
+
+    def _cerrar_sesion_activa() -> None:
+        nonlocal browser, context, page, grupo_sesion_actual
+        try:
+            if context is not None:
+                context.close()
+        except Exception:
+            pass
+        try:
+            if browser is not None:
+                browser.close()
+        except Exception:
+            pass
+        browser = None
+        context = None
+        page = None
+        grupo_sesion_actual = ""
+
     try:
-        hold_final = _as_bool_env("CARNET_HOLD_BROWSER_ON_FINISH", default=True)
-        for idx, item in enumerate(pendientes, start=1):
+        cursor_local = 0
+
+        while True:
+            if max_rows_int > 0 and procesados >= max_rows_int:
+                break
+
+            if is_multiworker_child:
+                item = _reservar_siguiente_item_para_worker(logger)
+                if not item:
+                    logger.info("[WORKER] Sin más registros reservables para este worker")
+                    break
+            else:
+                if cursor_local >= len(pendientes):
+                    break
+                item = pendientes[cursor_local]
+                cursor_local += 1
+
+            procesados += 1
             base_row = item.get("base_row")
+            compare_url = str(item.get("compare_url", "") or "").strip()
+            compare_row_number = int(item.get("compare_row_number", 0) or item.get("row_number", 0) or 0)
+            compare_fieldnames = item.get("fieldnames_compare", []) or []
+            fecha_hoy = datetime.now().strftime("%d/%m/%Y")
+
             if not base_row:
-                procesar_registro_cruce_en_formulario(None, logger, item)
+                _registrar_error_tramite_en_comparacion(
+                    logger,
+                    compare_url,
+                    compare_row_number,
+                    compare_fieldnames,
+                    f"DNI {item.get('dni', '')} no encontrado en hoja base",
+                    fecha_hoy,
+                )
+                _liberar_reserva_secuencia_si_aplica(logger, item)
                 continue
 
-            grupo = obtener_grupo_ruc(str(base_row.get("ruc", "") or item.get("departamento", "") or ""))
-            if grupo == "OTRO":
-                grupo = obtener_grupo_ruc(str(base_row.get("compania", "") or "JV"))
-            if grupo == "OTRO":
-                grupo = "JV"
-
+            grupo = _resolver_grupo_para_item(item)
             logger.info(
-                "[FILA %s] DNI=%s | GRUPO=%s | DEPARTAMENTO=%s | PUESTO=%s | SEDE=%s | MODALIDAD_OBJETIVO=%s | TIPO_DOC_OBJETIVO=%s | ORIGEN=%s | CRUCE_BASE_FILA=%s",
-                idx,
+                "[FILA %s] DNI=%s | COMPANIA=%s | GRUPO=%s | DEPARTAMENTO=%s | PUESTO=%s | SEDE=%s | MODALIDAD_OBJETIVO=%s | TIPO_DOC_OBJETIVO=%s | ORIGEN=%s | CRUCE_BASE_FILA=%s",
+                procesados,
                 item.get("dni", ""),
+                item.get("compania", ""),
                 grupo,
                 item.get("departamento", ""),
                 item.get("puesto", ""),
@@ -4697,61 +5215,131 @@ def _ejecutar_flujo_fila_por_fila(logger: logging.Logger, max_rows: int = 1) -> 
                 item.get("origen_sede", ""),
                 item.get("base_row_number", 0),
             )
-            mantener_abierto_en_esta_fila = bool(
-                hold_final and idx == len(pendientes) and (not _is_scheduled_mode())
-            )
 
-            intento = 0
-            while intento < max_login_retries_per_group:
-                intento += 1
-                logger.info(
-                    "[FILA %s][%s] Intento login %s/%s",
-                    idx,
-                    grupo,
-                    intento,
-                    max_login_retries_per_group,
-                )
+            sesion_operativa = False
+            ensure_tries = 3
+            for ensure_try in range(ensure_tries):
+                requiere_login = (page is None) or (grupo_sesion_actual != grupo)
+
+                if requiere_login:
+                    login_ok = False
+                    intento = 0
+                    while intento < max_login_retries_per_group:
+                        intento += 1
+                        logger.info(
+                            "[FILA %s][%s] Intento login %s/%s",
+                            procesados,
+                            grupo,
+                            intento,
+                            max_login_retries_per_group,
+                        )
+                        try:
+                            _cerrar_sesion_activa()
+                            browser, context, page = _abrir_sesion_grupo(playwright, logger, grupo)
+                            _ejecutar_login_en_pagina(page, logger, grupo)
+                            _cerrar_paginas_extra_context(context, page, logger)
+                            grupo_sesion_actual = grupo
+                            login_ok = True
+                            break
+                        except PlaywrightTimeoutError as exc:
+                            logger.warning(
+                                "[FILA %s][%s] Timeout en intento login %s: %s",
+                                procesados,
+                                grupo,
+                                intento,
+                                exc,
+                            )
+                            _cerrar_sesion_activa()
+                        except Exception as exc:
+                            logger.warning(
+                                "[FILA %s][%s] Error en intento login %s: %s",
+                                procesados,
+                                grupo,
+                                intento,
+                                exc,
+                            )
+                            _cerrar_sesion_activa()
+
+                        if intento < max_login_retries_per_group:
+                            espera_backoff = min(8, 1 + intento)
+                            logger.info(
+                                "[FILA %s][%s] Reintentando login en %ss...",
+                                procesados,
+                                grupo,
+                                espera_backoff,
+                            )
+                            time.sleep(espera_backoff)
+
+                    if not login_ok:
+                        break
+
                 try:
-                    ejecutar_login_grupo(
-                        playwright,
-                        logger,
-                        grupo,
-                        registro_formulario=item,
-                        keep_browser_open_on_finish=mantener_abierto_en_esta_fila,
-                    )
+                    navegar_dssp_carne_crear_solicitud(page, logger)
+                    if not validar_vista_crear_solicitud_por_ui(
+                        page,
+                        timeout_ms=max(2500, _safe_int_env("CARNET_CREAR_SOLICITUD_VALIDATION_TIMEOUT_MS", 6500)),
+                    ):
+                        raise Exception("No se confirmó vista CREAR SOLICITUD")
+                    _cerrar_paginas_extra_context(context, page, logger)
+                    sesion_operativa = True
                     break
-                except PlaywrightTimeoutError as exc:
-                    logger.warning(
-                        "[FILA %s][%s] Timeout en intento %s: %s",
-                        idx,
-                        grupo,
-                        intento,
-                        exc,
-                    )
                 except Exception as exc:
                     logger.warning(
-                        "[FILA %s][%s] Error en intento %s: %s",
-                        idx,
+                        "[FILA %s][%s] No se pudo dejar sesión en CREAR SOLICITUD (try %s/%s): %s",
+                        procesados,
                         grupo,
-                        intento,
+                        ensure_try + 1,
+                        ensure_tries,
                         exc,
                     )
+                    page_closed = False
+                    try:
+                        page_closed = (page is None) or page.is_closed()
+                    except Exception:
+                        page_closed = True
 
-                if intento >= max_login_retries_per_group:
-                    raise Exception(
-                        f"[FILA {idx}][{grupo}] No se pudo completar login tras {max_login_retries_per_group} intentos"
-                    )
+                    if page_closed:
+                        _cerrar_sesion_activa()
+                        continue
 
-                espera_backoff = min(8, 1 + intento)
-                logger.info(
-                    "[FILA %s][%s] Reintentando login en %ss...",
-                    idx,
-                    grupo,
-                    espera_backoff,
+                    # Reintento suave: misma sesión, sin relogin inmediato.
+                    if ensure_try + 1 < ensure_tries:
+                        try:
+                            _cerrar_paginas_extra_context(context, page, logger)
+                            page.wait_for_timeout(350)
+                        except Exception:
+                            pass
+                        continue
+
+                    _cerrar_sesion_activa()
+
+            if not sesion_operativa:
+                _registrar_error_tramite_en_comparacion(
+                    logger,
+                    compare_url,
+                    compare_row_number,
+                    compare_fieldnames,
+                    f"No se pudo confirmar vista CREAR SOLICITUD para grupo {grupo}",
+                    fecha_hoy,
                 )
-                time.sleep(espera_backoff)
+                _liberar_reserva_secuencia_si_aplica(logger, item)
+                continue
+
+            try:
+                procesar_registro_cruce_en_formulario(page, logger, item)
+            except Exception as exc:
+                logger.warning(
+                    "[FILA %s][%s] Excepción no controlada en procesamiento de registro: %s",
+                    procesados,
+                    grupo,
+                    exc,
+                )
+
+            _liberar_reserva_secuencia_si_aplica(logger, item)
+
         return 0
     finally:
+        _cerrar_sesion_activa()
         try:
             playwright.stop()
         except Exception:
@@ -4799,9 +5387,12 @@ def ejecutar_flujo_secundario() -> int:
         return 0
 
     if _as_bool_env("CARNET_ROW_BY_ROW", default=True):
+        row_limit = _safe_int_env("CARNET_FORM_PRUEBA_ROWS", 1)
+        if _as_bool_env("MULTIWORKER_CHILD", default=False):
+            row_limit = _safe_int_env("CARNET_WORKER_MAX_ROWS", 0)
         return _ejecutar_flujo_fila_por_fila(
             logger,
-            max_rows=max(1, _safe_int_env("CARNET_FORM_PRUEBA_ROWS", 1)),
+            max_rows=row_limit,
         )
 
     grupos = resolver_grupos_objetivo()
@@ -4843,22 +5434,24 @@ def ejecutar_flujo_secundario() -> int:
         logger.info("Navegador cerrado")
 
 
-def _build_units_for_workers() -> list:
-    grupos = resolver_grupos_objetivo()
-    units = []
-    for g in grupos:
-        creds = credenciales_por_grupo(g)
-        if creds.get("numero_documento") and creds.get("usuario") and creds.get("contrasena"):
-            units.append({"grupo": g})
-    return units
+def _build_units_for_workers(workers: int) -> list[dict]:
+    return [{"worker_id": wid} for wid in range(1, max(1, int(workers or 1)) + 1)]
 
 
-def _run_worker_unit(worker_id: int, unit: dict, workers: int, screen_w_eff: int, screen_h_eff: int, logger: logging.Logger) -> int:
-    grupo = unit["grupo"]
+def _run_worker_unit(
+    worker_id: int,
+    workers: int,
+    screen_w_eff: int,
+    screen_h_eff: int,
+    run_id: str,
+    logger: logging.Logger,
+) -> int:
     env = os.environ.copy()
     env["MULTIWORKER_CHILD"] = "1"
     env["WORKER_ID"] = str(worker_id)
-    env["WORKER_GROUP"] = grupo
+    env["WORKER_RUN_ID"] = run_id
+    env["CARNET_ROW_BY_ROW"] = "1"
+    env["CARNET_WORKER_MAX_ROWS"] = str(_safe_int_env("CARNET_WORKER_MAX_ROWS", 0))
     env["BROWSER_TILE_ENABLE"] = "1"
     env["BROWSER_TILE_TOTAL"] = str(workers)
     env["BROWSER_TILE_INDEX"] = str(worker_id - 1)
@@ -4869,7 +5462,7 @@ def _run_worker_unit(worker_id: int, unit: dict, workers: int, screen_w_eff: int
     env["BROWSER_TILE_FRAME_PAD"] = str(_safe_int_env("BROWSER_TILE_FRAME_PAD", 2))
 
     cmd = [sys.executable, str(BASE_DIR / "carnet_emision.py")]
-    logger.info("[W%s] Ejecutando grupo %s", worker_id, grupo)
+    logger.info("[W%s] Iniciando worker de lote | run_id=%s", worker_id, run_id)
 
     proc = subprocess.run(
         cmd,
@@ -4882,7 +5475,7 @@ def _run_worker_unit(worker_id: int, unit: dict, workers: int, screen_w_eff: int
     )
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    worker_log = LOGS_DIR / f"worker_{worker_id}_{grupo}_{stamp}.log"
+    worker_log = LOGS_DIR / f"worker_{worker_id}_batch_{stamp}.log"
     worker_log.write_text(
         "# STDOUT\n"
         + (proc.stdout or "")
@@ -4892,62 +5485,47 @@ def _run_worker_unit(worker_id: int, unit: dict, workers: int, screen_w_eff: int
     )
 
     if proc.returncode != 0:
-        logger.error("[W%s] Grupo %s falló con exit_code=%s | log=%s", worker_id, grupo, proc.returncode, worker_log)
+        logger.error("[W%s] Worker falló con exit_code=%s | log=%s", worker_id, proc.returncode, worker_log)
     else:
-        logger.info("[W%s] Grupo %s OK | log=%s", worker_id, grupo, worker_log)
+        logger.info("[W%s] Worker OK | log=%s", worker_id, worker_log)
     return proc.returncode
 
 
 def _ejecutar_scheduled_multihilo_orquestador() -> int:
     logger = setup_logger("carnet_emision_multi", suffix="orchestrator")
-    workers = max(1, min(4, _safe_int_env("SCHEDULED_WORKERS", 2)))
+    workers = max(1, min(4, _safe_int_env("SCHEDULED_WORKERS", 4)))
     screen_w_eff, screen_h_eff = _detect_windows_screen_size()
-    units = _build_units_for_workers()
+    units = _build_units_for_workers(workers)
     if not units:
-        logger.error("No hay unidades para workers. Revisa credenciales por grupo en .env")
+        logger.error("No hay unidades para workers")
         return 1
 
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+
     logger.info(
-        "SCHEDULED_MULTIWORKER activado | workers=%s | units=%s | pantalla_efectiva=%sx%s",
+        "SCHEDULED_MULTIWORKER activado | workers=%s | units=%s | run_id=%s | pantalla_efectiva=%sx%s",
         workers,
         len(units),
+        run_id,
         screen_w_eff,
         screen_h_eff,
     )
-    q = queue.Queue()
-    for unit in units:
-        q.put(unit)
-
-    lock = queue.Queue()
     results = []
 
     def worker_loop(worker_id: int):
-        processed = 0
-        while True:
-            try:
-                unit = q.get_nowait()
-            except Exception:
-                break
-            code = _run_worker_unit(worker_id, unit, workers, screen_w_eff, screen_h_eff, logger)
-            results.append({"worker": worker_id, "grupo": unit.get("grupo", ""), "exit_code": code})
-            processed += 1
-        lock.put(processed)
+        code = _run_worker_unit(worker_id, workers, screen_w_eff, screen_h_eff, run_id, logger)
+        results.append({"worker": worker_id, "exit_code": code})
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = [ex.submit(worker_loop, wid) for wid in range(1, workers + 1)]
+        futures = [ex.submit(worker_loop, unit["worker_id"]) for unit in units]
         for f in futures:
             f.result()
-
-    counts = []
-    while not lock.empty():
-        counts.append(lock.get())
-    logger.info("Conteo por worker: %s", counts)
 
     failed = [r for r in results if int(r.get("exit_code", 1)) != 0]
     if failed:
         logger.error("Workers con fallo: %s", len(failed))
         for r in failed:
-            logger.error("[W%s] grupo=%s exit=%s", r["worker"], r["grupo"], r["exit_code"])
+            logger.error("[W%s] exit=%s", r["worker"], r["exit_code"])
         return 1
 
     logger.info("Orquestador multihilo finalizado sin fallos")

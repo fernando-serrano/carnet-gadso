@@ -26,7 +26,8 @@ Estructura principal observada en el workspace:
 - `logs/`: logs por corrida.
 - `data/`: cache y datos auxiliares.
 - `secrets/carnet-drive-bot.json`: credenciales de cuenta de servicio.
-- `test/` y archivos `test_*.py`: scripts y pruebas auxiliares.
+- `test/`: scripts auxiliares de validacion.
+- `test/alternos/`: validaciones experimentales o no criticas para el flujo base (por ejemplo, analisis de duplicados o pruebas aisladas de deteccion).
 
 ## Arquitectura funcional
 
