@@ -2,6 +2,7 @@ import os
 import queue
 import re
 import shutil
+import json
 import subprocess
 import sys
 import time
@@ -5293,6 +5294,8 @@ def _ejecutar_flujo_fila_por_fila(logger: logging.Logger, max_rows: int = 1) -> 
     is_multiworker_child = _as_bool_env("MULTIWORKER_CHILD", default=False)
     max_login_retries_per_group = max(1, _safe_int_env("MAX_LOGIN_RETRIES_PER_GROUP", 12))
     max_rows_int = int(max_rows or 0)
+    worker_items_file = str(os.getenv("CARNET_WORKER_ITEMS_FILE", "") or "").strip()
+    worker_usa_items_preasignados = bool(is_multiworker_child and worker_items_file)
 
     pendientes = []
     if not is_multiworker_child:
@@ -5305,6 +5308,21 @@ def _ejecutar_flujo_fila_por_fila(logger: logging.Logger, max_rows: int = 1) -> 
         if not pendientes:
             logger.warning("[CRUCE] No hay registros pendientes para procesar uno por uno")
             return 0
+    elif worker_usa_items_preasignados:
+        try:
+            with Path(worker_items_file).open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            if isinstance(data, list):
+                pendientes = [x for x in data if isinstance(x, dict)]
+        except Exception as exc:
+            logger.warning("[WORKER] No se pudo cargar items preasignados: %s", exc)
+            pendientes = []
+
+        if not pendientes:
+            logger.info("[WORKER] Sin items preasignados para este worker")
+            return 0
+
+        logger.info("[WORKER] Items preasignados cargados: %s", len(pendientes))
 
     playwright = sync_playwright().start()
     procesados = 0
@@ -5338,10 +5356,27 @@ def _ejecutar_flujo_fila_por_fila(logger: logging.Logger, max_rows: int = 1) -> 
                 break
 
             if is_multiworker_child:
-                item = _reservar_siguiente_item_para_worker(logger)
-                if not item:
-                    logger.info("[WORKER] Sin más registros reservables para este worker")
-                    break
+                if worker_usa_items_preasignados:
+                    if cursor_local >= len(pendientes):
+                        logger.info("[WORKER] Sin más items preasignados para este worker")
+                        break
+                    item = pendientes[cursor_local]
+                    cursor_local += 1
+
+                    # Reserva defensiva de la fila en comparación para evitar colisiones
+                    # con corridas concurrentes fuera de este orquestador.
+                    if not _intentar_reservar_registro_compare(logger, item):
+                        logger.info(
+                            "[WORKER] Item preasignado no reservable (fila=%s DNI=%s); se omite",
+                            int(item.get("compare_row_number", 0) or item.get("row_number", 0) or 0),
+                            str(item.get("dni", "") or "").strip(),
+                        )
+                        continue
+                else:
+                    item = _reservar_siguiente_item_para_worker(logger)
+                    if not item:
+                        logger.info("[WORKER] Sin más registros reservables para este worker")
+                        break
             else:
                 if cursor_local >= len(pendientes):
                     break
@@ -5519,19 +5554,26 @@ def ejecutar_flujo_secundario() -> int:
     logger = setup_logger("carnet_emision", suffix=child_suffix)
     logger.info("INICIANDO FLUJO CARNET - Login automático")
 
-    try:
-        url_base = str(os.getenv("CARNET_GSHEET_URL", DEFAULT_GSHEET_URL) or DEFAULT_GSHEET_URL).strip()
-        confirmar_acceso_google_sheet(logger, url_base, "HOJA_BASE")
+    worker_items_file = str(os.getenv("CARNET_WORKER_ITEMS_FILE", "") or "").strip()
+    skip_precheck_worker = _as_bool_env("CARNET_WORKER_SKIP_PRECHECK", default=True)
+    es_worker_con_items = _as_bool_env("MULTIWORKER_CHILD", default=False) and bool(worker_items_file)
 
-        url_compare = str(os.getenv("CARNET_GSHEET_COMPARE_URL", DEFAULT_GSHEET_COMPARE_URL) or "").strip()
-        if url_compare:
-            confirmar_acceso_google_sheet(logger, url_compare, "HOJA_COMPARACION")
+    if es_worker_con_items and skip_precheck_worker:
+        logger.info("[WORKER] Precheck de hojas omitido: usando items preasignados por orquestador")
+    else:
+        try:
+            url_base = str(os.getenv("CARNET_GSHEET_URL", DEFAULT_GSHEET_URL) or DEFAULT_GSHEET_URL).strip()
+            confirmar_acceso_google_sheet(logger, url_base, "HOJA_BASE")
 
-        url_third = str(os.getenv("CARNET_GSHEET_THIRD_URL", DEFAULT_GSHEET_THIRD_URL) or "").strip()
-        if url_third:
-            confirmar_acceso_google_sheet(logger, url_third, "HOJA_TERCERA")
-    except Exception as exc:
-        logger.warning("No se pudo confirmar acceso a Google Sheets: %s", exc)
+            url_compare = str(os.getenv("CARNET_GSHEET_COMPARE_URL", DEFAULT_GSHEET_COMPARE_URL) or "").strip()
+            if url_compare:
+                confirmar_acceso_google_sheet(logger, url_compare, "HOJA_COMPARACION")
+
+            url_third = str(os.getenv("CARNET_GSHEET_THIRD_URL", DEFAULT_GSHEET_THIRD_URL) or "").strip()
+            if url_third:
+                confirmar_acceso_google_sheet(logger, url_third, "HOJA_TERCERA")
+        except Exception as exc:
+            logger.warning("No se pudo confirmar acceso a Google Sheets: %s", exc)
 
     if _as_bool_env("CARNET_SHEET_CROSSCHECK_ONLY", default=False):
         try:
@@ -5605,6 +5647,18 @@ def _build_units_for_workers(workers: int) -> list[dict]:
     return [{"worker_id": wid} for wid in range(1, max(1, int(workers or 1)) + 1)]
 
 
+def _distribuir_items_preasignados_para_workers(items: list[dict], workers: int) -> dict[int, list[dict]]:
+    distribucion = {wid: [] for wid in range(1, max(1, int(workers or 1)) + 1)}
+    if not items:
+        return distribucion
+
+    worker_ids = sorted(distribucion.keys())
+    for idx, item in enumerate(items):
+        wid = worker_ids[idx % len(worker_ids)]
+        distribucion[wid].append(item)
+    return distribucion
+
+
 def _run_worker_unit(
     worker_id: int,
     workers: int,
@@ -5612,6 +5666,7 @@ def _run_worker_unit(
     screen_h_eff: int,
     run_id: str,
     logger: logging.Logger,
+    worker_items_file: str = "",
 ) -> int:
     env = os.environ.copy()
     env["MULTIWORKER_CHILD"] = "1"
@@ -5627,6 +5682,9 @@ def _run_worker_unit(
     env["BROWSER_TILE_TOP_OFFSET"] = str(_safe_int_env("BROWSER_TILE_TOP_OFFSET", 0))
     env["BROWSER_TILE_GAP"] = str(_safe_int_env("BROWSER_TILE_GAP", 6))
     env["BROWSER_TILE_FRAME_PAD"] = str(_safe_int_env("BROWSER_TILE_FRAME_PAD", 2))
+    if worker_items_file:
+        env["CARNET_WORKER_ITEMS_FILE"] = worker_items_file
+        env.setdefault("CARNET_WORKER_SKIP_PRECHECK", "1")
 
     cmd = [sys.executable, str(BASE_DIR / "carnet_emision.py")]
     logger.info("[W%s] Iniciando worker de lote | run_id=%s", worker_id, run_id)
@@ -5663,11 +5721,55 @@ def _ejecutar_scheduled_multihilo_orquestador() -> int:
     workers = max(1, min(4, _safe_int_env("SCHEDULED_WORKERS", 4)))
     screen_w_eff, screen_h_eff = _detect_windows_screen_size()
     units = _build_units_for_workers(workers)
-    if not units:
-        logger.error("No hay unidades para workers")
-        return 1
 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    preload_enabled = _as_bool_env("SCHEDULED_PRELOAD_ITEMS_FOR_WORKERS", default=True)
+    if preload_enabled:
+        max_preload = max(1, _safe_int_env("CARNET_WORKER_PRELOAD_SCAN_ROWS", 600))
+        permitir_stale = _as_bool_env("CARNET_COMPARE_ALLOW_STALE_IN_PROGRESS", default=True)
+        try:
+            candidatos = _cargar_cruce_pendiente_desde_hojas(
+                logger,
+                max_rows=max_preload,
+                preasignar_secuencias=False,
+                permitir_en_proceso_expirado=permitir_stale,
+            )
+        except Exception as exc:
+            logger.warning("Precarga de items falló; se usará reserva dinámica por worker: %s", exc)
+            candidatos = []
+
+        if candidatos:
+            asignacion = _distribuir_items_preasignados_para_workers(candidatos, workers)
+            units = []
+            for wid in sorted(asignacion.keys()):
+                items_w = asignacion[wid]
+                if not items_w:
+                    continue
+                items_file = LOGS_DIR / f"worker_{wid}_items_{run_id}.json"
+                try:
+                    items_file.write_text(
+                        json.dumps(items_w, ensure_ascii=False, separators=(",", ":")),
+                        encoding="utf-8",
+                    )
+                    units.append({
+                        "worker_id": wid,
+                        "items_file": str(items_file),
+                        "assigned": len(items_w),
+                    })
+                except Exception as exc:
+                    logger.warning("No se pudo guardar items preasignados para W%s: %s", wid, exc)
+
+            if units:
+                logger.info(
+                    "Precarga de registros activada: candidatos=%s | workers_activos=%s",
+                    len(candidatos),
+                    len(units),
+                )
+
+    if not units:
+        logger.info("Sin unidades con trabajo para workers; fin de corrida")
+        return 0
 
     logger.info(
         "SCHEDULED_MULTIWORKER activado | workers=%s | units=%s | run_id=%s | pantalla_efectiva=%sx%s",
@@ -5679,12 +5781,22 @@ def _ejecutar_scheduled_multihilo_orquestador() -> int:
     )
     results = []
 
-    def worker_loop(worker_id: int):
-        code = _run_worker_unit(worker_id, workers, screen_w_eff, screen_h_eff, run_id, logger)
+    def worker_loop(unit: dict):
+        worker_id = int(unit.get("worker_id", 0) or 0)
+        worker_items_file = str(unit.get("items_file", "") or "")
+        code = _run_worker_unit(
+            worker_id,
+            workers,
+            screen_w_eff,
+            screen_h_eff,
+            run_id,
+            logger,
+            worker_items_file=worker_items_file,
+        )
         results.append({"worker": worker_id, "exit_code": code})
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = [ex.submit(worker_loop, unit["worker_id"]) for unit in units]
+        futures = [ex.submit(worker_loop, unit) for unit in units]
         for f in futures:
             f.result()
 
