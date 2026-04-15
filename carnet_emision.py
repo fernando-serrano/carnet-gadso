@@ -369,7 +369,7 @@ def setup_logger(name: str = "carnet_emision", suffix: str = "") -> logging.Logg
     # Aplicamos retención por carpetas para evitar crecimiento indefinido.
     if _as_bool_env("CARNET_LOG_RUNS_PRUNE_ENABLED", default=True):
         try:
-            keep_run_dirs = max(1, _safe_int_env("CARNET_LOG_RUNS_KEEP_DIRS", 20))
+            keep_run_dirs = max(1, _safe_int_env("CARNET_LOG_RUNS_KEEP_DIRS", 10))
             current_log_dir = LOGS_DIR.resolve()
             runs_dir = current_log_dir.parent
             if runs_dir.name.lower() == "runs" and current_log_dir.is_dir():
