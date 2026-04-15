@@ -4125,13 +4125,29 @@ def procesar_registro_cruce_en_formulario(page, logger: logging.Logger, item: di
     secuencia_exitosa = False
     filas_secuencia_probadas: set[int] = set()
     max_intentos_secuencia = max(1, _safe_int_env("CARNET_MAX_SECUENCIA_INTENTOS", 40))
+    secuencia_preasignada_consumida = False
     for intento_num in range(1, max_intentos_secuencia + 1):
-        reservado = _reservar_siguiente_secuencia_para_worker(
-            logger,
-            item,
-            dni,
-            filas_excluidas=filas_secuencia_probadas,
-        )
+        reservado = None
+        if not secuencia_preasignada_consumida:
+            nro_pre = str(item.get("nro_secuencia_objetivo", "") or item.get("copia_secuencia_pago", "") or "").strip()
+            token_pre = str(item.get("tercera_reserva_token", "") or "").strip()
+            row_pre = int(item.get("tercera_row_number", 0) or 0)
+            if nro_pre and token_pre and row_pre > 0:
+                reservado = {
+                    "row_number": row_pre,
+                    "token": token_pre,
+                    "copia_secuencia_pago_raw": str(item.get("copia_secuencia_pago_raw", "") or nro_pre),
+                    "copia_secuencia_pago": nro_pre,
+                }
+                secuencia_preasignada_consumida = True
+
+        if reservado is None:
+            reservado = _reservar_siguiente_secuencia_para_worker(
+                logger,
+                item,
+                dni,
+                filas_excluidas=filas_secuencia_probadas,
+            )
         if not reservado:
             logger.warning("[FORM] Sin secuencias libres/reservables para DNI=%s tras %s intentos", dni, intento_num - 1)
             break
@@ -5647,6 +5663,100 @@ def _build_units_for_workers(workers: int) -> list[dict]:
     return [{"worker_id": wid} for wid in range(1, max(1, int(workers or 1)) + 1)]
 
 
+def _preasignar_secuencia_inicial_por_item(logger: logging.Logger, items: list[dict]) -> int:
+    """Reserva una secuencia inicial por item para reducir latencia por registro."""
+    if not items:
+        return 0
+
+    tercera_url = str(os.getenv("CARNET_GSHEET_THIRD_URL", DEFAULT_GSHEET_THIRD_URL) or "").strip()
+    if not tercera_url:
+        return 0
+
+    try:
+        rows_third, fields_third = _leer_google_sheet_rows(tercera_url, logger)
+    except Exception as exc:
+        logger.warning("[ORQ][SECUENCIA] No se pudo leer tercera hoja para preasignación: %s", exc)
+        return 0
+
+    col_third_dni = _resolver_columna(fields_third, ["dni"])
+    col_third_copia = _resolver_columna(
+        fields_third,
+        ["copia de secuencia de pago", "copia secuencia de pago", "secuencia de pago"],
+    )
+    col_third_estado = _resolver_columna(
+        fields_third,
+        ["estado secuencia de pago", "estado secuencia pago", "estado_secuencia_pago", "estado secuencia"],
+    )
+
+    if not col_third_copia or not col_third_estado:
+        logger.warning("[ORQ][SECUENCIA] No se resolvieron columnas necesarias en tercera hoja")
+        return 0
+
+    lease_min = max(5, _safe_int_env("CARNET_TERCERA_RESERVA_LEASE_MINUTES", 120))
+    disponibles = []
+    for row_number, row in enumerate(rows_third, start=2):
+        copia_raw = str(row.get(col_third_copia, "") or "").strip()
+        if not copia_raw:
+            continue
+
+        estado_raw = str(row.get(col_third_estado, "") or "").strip()
+        estado_norm = _normalizar_columna(estado_raw)
+        if estado_norm == "usado":
+            continue
+
+        reserva_expirada = _estado_reserva_expirada(estado_raw, lease_minutes=lease_min)
+        if estado_norm and not reserva_expirada:
+            continue
+
+        dni_actual = str(row.get(col_third_dni, "") or "").strip() if col_third_dni else ""
+        if dni_actual and (not reserva_expirada) and estado_norm != "no encontrado":
+            continue
+
+        disponibles.append(
+            {
+                "row_number": row_number,
+                "copia_secuencia_pago_raw": copia_raw,
+                "copia_secuencia_pago": normalizar_copia_secuencia_pago(copia_raw),
+            }
+        )
+
+    reservadas = 0
+    for item, seq in zip(items, disponibles):
+        dni = str(item.get("dni", "") or "").strip()
+        if not dni:
+            continue
+
+        token = _token_estado_secuencia_reservada(dni)
+        updates = {col_third_estado: token}
+        if col_third_dni:
+            updates[col_third_dni] = dni
+
+        try:
+            _actualizar_fila_tercera_hoja_por_row(
+                logger,
+                tercera_url,
+                int(seq["row_number"]),
+                updates,
+                fieldnames=fields_third,
+            )
+        except Exception:
+            continue
+
+        item["tercera_url"] = tercera_url
+        item["fieldnames_third"] = fields_third
+        item["col_third_estado_sec"] = col_third_estado
+        item["col_third_dni"] = col_third_dni
+        item["tercera_row_number"] = int(seq["row_number"])
+        item["copia_secuencia_pago_raw"] = str(seq["copia_secuencia_pago_raw"])
+        item["copia_secuencia_pago"] = str(seq["copia_secuencia_pago"])
+        item["nro_secuencia_objetivo"] = str(seq["copia_secuencia_pago"])
+        item["nro_secuencia_origen"] = "tercera_hoja:preasignada_orquestador"
+        item["tercera_reserva_token"] = token
+        reservadas += 1
+
+    return reservadas
+
+
 def _distribuir_items_preasignados_para_workers(items: list[dict], workers: int) -> dict[int, list[dict]]:
     distribucion = {wid: [] for wid in range(1, max(1, int(workers or 1)) + 1)}
     if not items:
@@ -5740,6 +5850,7 @@ def _ejecutar_scheduled_multihilo_orquestador() -> int:
             candidatos = []
 
         if candidatos:
+            secuencias_preasignadas = _preasignar_secuencia_inicial_por_item(logger, candidatos)
             asignacion = _distribuir_items_preasignados_para_workers(candidatos, workers)
             units = []
             for wid in sorted(asignacion.keys()):
@@ -5762,8 +5873,9 @@ def _ejecutar_scheduled_multihilo_orquestador() -> int:
 
             if units:
                 logger.info(
-                    "Precarga de registros activada: candidatos=%s | workers_activos=%s",
+                    "Precarga de registros activada: candidatos=%s | secuencias_preasignadas=%s | workers_activos=%s",
                     len(candidatos),
+                    secuencias_preasignadas,
                     len(units),
                 )
 
