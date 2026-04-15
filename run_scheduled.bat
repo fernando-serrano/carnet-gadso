@@ -16,6 +16,7 @@ set RUN_LOG=%RUN_DIR%\run_scheduled_%TS%.log
 set RUN_MODE=scheduled
 set SCHEDULED_MULTIWORKER=1
 if "%SCHEDULED_WORKERS%"=="" set SCHEDULED_WORKERS=4
+set CARNET_COMPARE_ALLOW_EMPTY_ESTADO=0
 set LOG_DIR=%RUN_DIR%
 
 echo [INFO] Modo scheduled multihilo activado

@@ -328,9 +328,57 @@ def _prune_log_files_by_count(log_dir: Path, keep_files: int, pattern: str = "*.
     return eliminados
 
 
+def _prune_run_dirs_by_count(runs_dir: Path, keep_dirs: int, current_run_dir: Path | None = None) -> int:
+    """Elimina carpetas antiguas de runs preservando la corrida actual si aplica."""
+    try:
+        keep = max(1, int(keep_dirs or 1))
+    except Exception:
+        keep = 1
+
+    try:
+        dirs = [p for p in runs_dir.iterdir() if p.is_dir()]
+    except Exception:
+        return 0
+
+    if len(dirs) <= keep:
+        return 0
+
+    dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    eliminados = 0
+    for viejo in dirs[keep:]:
+        try:
+            if current_run_dir and viejo.resolve() == current_run_dir.resolve():
+                continue
+        except Exception:
+            pass
+        try:
+            shutil.rmtree(viejo)
+            eliminados += 1
+        except Exception:
+            continue
+    return eliminados
+
+
 def setup_logger(name: str = "carnet_emision", suffix: str = "") -> logging.Logger:
     ensure_directories()
     suffix_clean = f"_{suffix}" if suffix else ""
+    pruned_run_dirs = 0
+
+    # En modo scheduled, LOG_DIR apunta a logs/runs/scheduled_*.
+    # Aplicamos retención por carpetas para evitar crecimiento indefinido.
+    if _as_bool_env("CARNET_LOG_RUNS_PRUNE_ENABLED", default=True):
+        try:
+            keep_run_dirs = max(1, _safe_int_env("CARNET_LOG_RUNS_KEEP_DIRS", 20))
+            current_log_dir = LOGS_DIR.resolve()
+            runs_dir = current_log_dir.parent
+            if runs_dir.name.lower() == "runs" and current_log_dir.is_dir():
+                pruned_run_dirs = _prune_run_dirs_by_count(
+                    runs_dir,
+                    keep_dirs=keep_run_dirs,
+                    current_run_dir=current_log_dir,
+                )
+        except Exception:
+            pruned_run_dirs = 0
 
     # Política recomendada para servidor: archivo único y limpieza al inicio.
     single_file_raw = str(os.getenv("CARNET_LOG_SINGLE_FILE", "1") or "1").strip().lower()
@@ -377,6 +425,8 @@ def setup_logger(name: str = "carnet_emision", suffix: str = "") -> logging.Logg
         logger.info("Log único truncado por umbral de líneas: %s (max=%s)", log_file, max_lines)
     if pruned_logs > 0:
         logger.info("Retención de logs aplicada: %s archivos antiguos eliminados", pruned_logs)
+    if pruned_run_dirs > 0:
+        logger.info("Retención de runs aplicada: %s carpetas antiguas eliminadas", pruned_run_dirs)
     logger.info("Log inicializado en %s", log_file)
     return logger
 
@@ -1378,7 +1428,7 @@ def _cargar_cruce_pendiente_desde_hojas(
     }
     if not estados_objetivo:
         estados_objetivo = {"pendiente"}
-    permitir_estado_vacio = _as_bool_env("CARNET_COMPARE_ALLOW_EMPTY_ESTADO", default=True)
+    permitir_estado_vacio = _as_bool_env("CARNET_COMPARE_ALLOW_EMPTY_ESTADO", default=False)
     lease_min_compare = max(5, _safe_int_env("CARNET_COMPARE_RESERVA_LEASE_MINUTES", 120))
     logger.info(
         "[CRUCE] Criterio ESTADO: objetivos=%s | permitir_vacio=%s | permitir_en_proceso_expirado=%s | lease_min=%s",
@@ -1392,6 +1442,13 @@ def _cargar_cruce_pendiente_desde_hojas(
     registros_saltados_sin_dni = 0
     registros_saltados_estado_fuera_criterio = 0
     indice_comprobante_libre = 0
+    log_detalle_cruce = _as_bool_env("CARNET_CRUCE_LOG_DETALLE", default=False)
+    max_detalle_ok = max(0, _safe_int_env("CARNET_CRUCE_LOG_MAX_OK", 25))
+    max_detalle_warn = max(0, _safe_int_env("CARNET_CRUCE_LOG_MAX_WARN", 50))
+    detalle_ok_emitidos = 0
+    detalle_warn_emitidos = 0
+    detalle_ok_suprimidos = 0
+    detalle_warn_suprimidos = 0
     
     for idx, row in enumerate(rows_compare, start=2):
         dni = str(row.get(col_cmp_dni, "") or "").strip()
@@ -1440,32 +1497,40 @@ def _cargar_cruce_pendiente_desde_hojas(
                 indice_comprobante_libre += 1
 
         if base_row:
-            logger.info(
-                "[CRUCE][OK] COMP_FILA=%s | DNI=%s | BASE_FILA=%s | BASE_TOTAL=%s | BASE_FECHA=%s | BASE_CRITERIO=%s | DEPARTAMENTO=%s | PUESTO=%s | MODALIDAD_OBJETIVO=%s | TIPO_DOC_OBJETIVO=%s | DNI_NORMALIZADO=%s | COPIA_SEC_PAGO_RAW=%s | COPIA_SEC_PAGO_APLICADA=%s | ESTADO_SECUENCIA_PAGO=%s | NRO_SEC_ORIGEN=%s | TERCERA_FILA=%s",
-                idx,
-                dni,
-                base_row_number,
-                len(rows_base),
-                base_fecha_cercana.strftime("%d/%m/%Y") if base_fecha_cercana else "N/D",
-                base_criterio_seleccion or "sin_criterio",
-                departamento,
-                puesto,
-                modalidad_objetivo,
-                tipo_doc_objetivo,
-                dni_normalizado_tipo_doc,
-                copia_secuencia_pago_raw,
-                copia_secuencia_pago,
-                estado_secuencia_pago,
-                nro_secuencia_origen,
-                tercera_row_number,
-            )
+            if log_detalle_cruce and (max_detalle_ok == 0 or detalle_ok_emitidos < max_detalle_ok):
+                logger.info(
+                    "[CRUCE][OK] COMP_FILA=%s | DNI=%s | BASE_FILA=%s | BASE_TOTAL=%s | BASE_FECHA=%s | BASE_CRITERIO=%s | DEPARTAMENTO=%s | PUESTO=%s | MODALIDAD_OBJETIVO=%s | TIPO_DOC_OBJETIVO=%s | DNI_NORMALIZADO=%s | COPIA_SEC_PAGO_RAW=%s | COPIA_SEC_PAGO_APLICADA=%s | ESTADO_SECUENCIA_PAGO=%s | NRO_SEC_ORIGEN=%s | TERCERA_FILA=%s",
+                    idx,
+                    dni,
+                    base_row_number,
+                    len(rows_base),
+                    base_fecha_cercana.strftime("%d/%m/%Y") if base_fecha_cercana else "N/D",
+                    base_criterio_seleccion or "sin_criterio",
+                    departamento,
+                    puesto,
+                    modalidad_objetivo,
+                    tipo_doc_objetivo,
+                    dni_normalizado_tipo_doc,
+                    copia_secuencia_pago_raw,
+                    copia_secuencia_pago,
+                    estado_secuencia_pago,
+                    nro_secuencia_origen,
+                    tercera_row_number,
+                )
+                detalle_ok_emitidos += 1
+            else:
+                detalle_ok_suprimidos += 1
         else:
-            logger.warning(
-                "[CRUCE][WARN] COMP_FILA=%s | DNI=%s sin cruce en HOJA_BASE (total=%s)",
-                idx,
-                dni,
-                len(rows_base),
-            )
+            if max_detalle_warn == 0 or detalle_warn_emitidos < max_detalle_warn:
+                logger.warning(
+                    "[CRUCE][WARN] COMP_FILA=%s | DNI=%s sin cruce en HOJA_BASE (total=%s)",
+                    idx,
+                    dni,
+                    len(rows_base),
+                )
+                detalle_warn_emitidos += 1
+            else:
+                detalle_warn_suprimidos += 1
 
         pendientes.append(
             {
@@ -1517,6 +1582,16 @@ def _cargar_cruce_pendiente_desde_hojas(
         registros_saltados_sin_dni,
         registros_saltados_estado_fuera_criterio,
     )
+    if detalle_ok_suprimidos > 0:
+        logger.info(
+            "[CRUCE] Detalle OK suprimido: %s fila(s). Para ver detalle use CARNET_CRUCE_LOG_DETALLE=1",
+            detalle_ok_suprimidos,
+        )
+    if detalle_warn_suprimidos > 0:
+        logger.warning(
+            "[CRUCE] Warns de sin cruce suprimidos: %s fila(s). Ajuste CARNET_CRUCE_LOG_MAX_WARN si desea más detalle",
+            detalle_warn_suprimidos,
+        )
 
     return pendientes
 

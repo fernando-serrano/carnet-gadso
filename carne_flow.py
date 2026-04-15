@@ -42,8 +42,41 @@ BASE_DIR = Path(__file__).resolve().parent
 STAGING_DIR = BASE_DIR / "logs" / ".cache_carne_flow"
 
 
+def _prune_staging_csv_by_count(keep_files: int = 30) -> int:
+    try:
+        keep = max(1, int(keep_files or 1))
+    except Exception:
+        keep = 30
+
+    try:
+        archivos = [p for p in STAGING_DIR.glob("*.csv") if p.is_file()]
+    except Exception:
+        return 0
+
+    if len(archivos) <= keep:
+        return 0
+
+    archivos.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    eliminados = 0
+    for viejo in archivos[keep:]:
+        try:
+            viejo.unlink(missing_ok=True)
+            eliminados += 1
+        except Exception:
+            continue
+    return eliminados
+
+
 def _descargar_sheet_csv_a_local(sheet_url: str, logger, etiqueta: str) -> Path:
     STAGING_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        keep_staging = max(1, int(str(os.getenv("CARNET_CARNE_FLOW_STAGING_KEEP_FILES", "30") or "30").strip()))
+    except Exception:
+        keep_staging = 30
+    pruned = _prune_staging_csv_by_count(keep_files=keep_staging)
+    if pruned > 0:
+        logger.info("[CARNE_FLOW] Retención staging: %s CSV antiguos eliminados", pruned)
+
     csv_url = _build_google_sheet_csv_url(sheet_url)
     destino = STAGING_DIR / f"{etiqueta.lower()}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
 
@@ -165,7 +198,7 @@ def obtener_primer_registro_objetivo(logger):
     if not estados_objetivo:
         estados_objetivo = {"pendiente"}
 
-    permitir_estado_vacio = _as_bool_env("CARNET_COMPARE_ALLOW_EMPTY_ESTADO", default=True)
+    permitir_estado_vacio = _as_bool_env("CARNET_COMPARE_ALLOW_EMPTY_ESTADO", default=False)
 
     logger.info(
         "[CARNE_FLOW] Criterio ESTADO: objetivos=%s | permitir_vacio=%s",
@@ -190,6 +223,9 @@ def obtener_primer_registro_objetivo(logger):
     saltados_sin_dni = 0
     saltados_estado = 0
     saltados_sin_cruce = 0
+    max_warn_sin_cruce = max(0, int(str(os.getenv("CARNET_CARNE_FLOW_MAX_WARN_SIN_CRUCE", "40") or "40").strip() or "40"))
+    warns_sin_cruce_emitidos = 0
+    warns_sin_cruce_suprimidos = 0
 
     for idx, row in enumerate(rows_compare, start=2):
         total += 1
@@ -207,7 +243,11 @@ def obtener_primer_registro_objetivo(logger):
         base_row = base_por_dni.get(dni)
         if not base_row:
             saltados_sin_cruce += 1
-            logger.warning("[CARNE_FLOW] Fila %s DNI=%s cumple estado pero no existe en hoja base", idx, dni)
+            if max_warn_sin_cruce == 0 or warns_sin_cruce_emitidos < max_warn_sin_cruce:
+                logger.warning("[CARNE_FLOW] Fila %s DNI=%s cumple estado pero no existe en hoja base", idx, dni)
+                warns_sin_cruce_emitidos += 1
+            else:
+                warns_sin_cruce_suprimidos += 1
             continue
 
         departamento = _valor_fila_por_indice(base_row, col_base_departamento)
@@ -249,6 +289,11 @@ def obtener_primer_registro_objetivo(logger):
     if estados_detectados:
         muestras = ", ".join(list(estados_detectados.keys())[:20])
         logger.warning("[CARNE_FLOW] Estados detectados en hoja compare: %s", muestras)
+    if warns_sin_cruce_suprimidos > 0:
+        logger.warning(
+            "[CARNE_FLOW] Warns de sin cruce suprimidos: %s fila(s). Ajuste CARNET_CARNE_FLOW_MAX_WARN_SIN_CRUCE para ampliar detalle",
+            warns_sin_cruce_suprimidos,
+        )
     return None
 
 
