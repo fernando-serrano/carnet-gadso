@@ -3314,6 +3314,71 @@ def _registrar_estado_post_guardar_en_comparacion(
         logger.warning("[FORM] No se pudo actualizar estado post-guardar en comparación: %s", exc)
 
 
+def _registrar_estado_en_transmision_en_comparacion(
+    logger: logging.Logger,
+    compare_url: str,
+    compare_row_number: int,
+    compare_fieldnames: list[str],
+    fecha_tramite: str,
+) -> None:
+    if not compare_url or compare_row_number <= 0:
+        return
+
+    try:
+        _, _, worker_tag = _worker_identity()
+        _actualizar_fila_comparacion_por_row(
+            logger,
+            compare_url,
+            compare_row_number,
+            {
+                "observacion": "SOLICITUD EN TRANSMISION",
+                "observación": "SOLICITUD EN TRANSMISION",
+                "estado_tramite": "EN TRANSMISION",
+                "estado tramite": "EN TRANSMISION",
+                "responsable": f"BOT CARNÉ SUCAMEC {worker_tag}",
+                "fecha tramite": str(fecha_tramite or "").strip(),
+                "fecha_tramite": str(fecha_tramite or "").strip(),
+            },
+            fieldnames=compare_fieldnames,
+        )
+        logger.info("[FORM] Fila comparacion %s marcada EN TRANSMISION", compare_row_number)
+    except Exception as exc:
+        logger.warning("[FORM] No se pudo actualizar estado EN TRANSMISION en comparación: %s", exc)
+
+
+def _registrar_estado_transmitido_en_comparacion(
+    logger: logging.Logger,
+    compare_url: str,
+    compare_row_number: int,
+    compare_fieldnames: list[str],
+    fecha_tramite: str,
+    responsable: str = "BOT CARNÉ SUCAMEC",
+) -> None:
+    if not compare_url or compare_row_number <= 0:
+        return
+
+    estado_post = "TRANSMITIDO"
+    observacion_post = str(
+        os.getenv("CARNET_OBSERVACION_POST_TRANSMITIR", "Transmitido sin observaciones")
+        or "Transmitido sin observaciones"
+    ).strip()
+    try:
+        _actualizar_fila_comparacion_por_row(
+            logger,
+            compare_url,
+            compare_row_number,
+            {
+                "observacion": observacion_post,
+                "estado_tramite": estado_post,
+                "responsable": str(responsable or "BOT CARNÉ SUCAMEC"),
+                "fecha_tramite": str(fecha_tramite or "").strip(),
+            },
+            fieldnames=compare_fieldnames,
+        )
+    except Exception:
+        pass
+
+
 def _marcar_secuencia_usada_en_tercera_hoja(
     logger: logging.Logger,
     item: dict,
@@ -3489,6 +3554,59 @@ def seleccionar_estado_bandeja(page, logger: logging.Logger, estado_objetivo: st
         logger.info("[BANDEJA] Búsqueda ejecutada con Estado=%s", estado_objetivo)
     except Exception as exc:
         raise Exception(f"No se pudo accionar Buscar en bandeja: {exc}")
+
+
+def _fila_bandeja_por_dni(page, dni: str):
+    dni_digits = "".join(ch for ch in str(dni or "") if ch.isdigit())
+    if not dni_digits:
+        return None
+
+    tbody = page.locator(SEL["bandeja_resultados_tbody"]).first
+    tbody.wait_for(state="visible", timeout=8000)
+    filas = tbody.locator("tr")
+
+    try:
+        total = int(filas.count())
+    except Exception:
+        total = 0
+
+    for idx in range(total):
+        fila = filas.nth(idx)
+        try:
+            txt = str(fila.inner_text() or "").strip()
+        except Exception:
+            txt = ""
+        if not txt:
+            continue
+        txt_digits = "".join(ch for ch in txt if ch.isdigit())
+        if dni_digits and dni_digits in txt_digits:
+            return fila
+    return None
+
+
+def existe_registro_en_bandeja_por_dni(page, dni: str) -> bool:
+    return _fila_bandeja_por_dni(page, dni) is not None
+
+
+def seleccionar_registro_bandeja_por_dni(page, logger: logging.Logger, dni: str) -> None:
+    """Selecciona solo el checkbox de la fila cuyo texto contiene el DNI del registro actual."""
+    fila = _fila_bandeja_por_dni(page, dni)
+    if fila is None:
+        raise Exception(f"No se encontró fila en bandeja para DNI={dni}")
+
+    chk = fila.locator("td.ui-selection-column .ui-chkbox-box").first
+    chk.wait_for(state="visible", timeout=7000)
+    cls = str(chk.get_attribute("class") or "")
+    if "ui-state-active" not in cls:
+        chk.click(timeout=7000)
+        esperar_ajax_primefaces(page, timeout_ms=5000)
+        page.wait_for_timeout(250)
+
+    cls_final = str(chk.get_attribute("class") or "")
+    if "ui-state-active" not in cls_final:
+        raise Exception(f"No se logró activar checkbox de fila para DNI={dni}")
+
+    logger.info("[BANDEJA] Checkbox de fila activado para DNI=%s", dni)
 
 
 def seleccionar_todos_resultados_bandeja(page, logger: logging.Logger) -> None:
@@ -4280,13 +4398,39 @@ def procesar_registro_cruce_en_formulario(page, logger: logging.Logger, item: di
     nombre_form = str(item.get("nombre_formulario", "") or "").strip()
     _marcar_secuencia_usada_en_tercera_hoja(logger, item, dni, nombre_form)
 
+    # Estado intermedio para trazabilidad durante la fase de bandeja/transmisión.
+    _registrar_estado_en_transmision_en_comparacion(
+        logger,
+        compare_url,
+        compare_row_number,
+        compare_fieldnames,
+        fecha_hoy,
+    )
+
     # Paso 3: Ir a Bandeja de Carnés y filtrar por estado CREADO.
     estado_bandeja_objetivo = str(os.getenv("CARNET_BANDEJA_ESTADO_OBJETIVO", "CREADO") or "CREADO").strip() or "CREADO"
+    transmitido_por_otro_worker = False
     try:
         navegar_dssp_carne_bandeja_carnes(page, logger)
         seleccionar_estado_bandeja(page, logger, estado_objetivo=estado_bandeja_objetivo)
-        seleccionar_todos_resultados_bandeja(page, logger)
-        transmitir_resultados_bandeja(page, logger)
+        try:
+            seleccionar_registro_bandeja_por_dni(page, logger, dni)
+            transmitir_resultados_bandeja(page, logger)
+        except Exception as exc_seleccion:
+            logger.warning(
+                "[BANDEJA] No se pudo transmitir fila por DNI=%s con estado=%s: %s",
+                dni,
+                estado_bandeja_objetivo,
+                exc_seleccion,
+            )
+            # Revalidación: pudo ser transmitido por otro worker entre guardado y transmisión.
+            estado_transmitido = str(os.getenv("CARNET_BANDEJA_ESTADO_TRANSMITIDO", "TRANSMITIDO") or "TRANSMITIDO").strip() or "TRANSMITIDO"
+            seleccionar_estado_bandeja(page, logger, estado_objetivo=estado_transmitido)
+            if existe_registro_en_bandeja_por_dni(page, dni):
+                transmitido_por_otro_worker = True
+                logger.info("[BANDEJA] Registro DNI=%s ya aparece en estado %s (posible transmisión por otro worker)", dni, estado_transmitido)
+            else:
+                raise exc_seleccion
     except Exception as exc:
         msg_bandeja = f"Solicitud guardada, pero falló navegación/filtro en Bandeja ({estado_bandeja_objetivo}): {exc}"
         _registrar_error_tramite_en_comparacion(
@@ -4300,21 +4444,18 @@ def procesar_registro_cruce_en_formulario(page, logger: logging.Logger, item: di
         return False
 
     # Actualizar hoja de comparación
-    if compare_url and compare_row_number > 0:
-        try:
-            estado_post = "TRANSMITIDO"
-            observacion_post = str(os.getenv("CARNET_OBSERVACION_POST_TRANSMITIR", "Transmitido sin observaciones") or "Transmitido sin observaciones").strip()
-            _actualizar_fila_comparacion_por_row(logger, compare_url, compare_row_number,
-                {
-                    "observacion": observacion_post,
-                    "estado_tramite": estado_post,
-                    "responsable": "BOT CARNÉ SUCAMEC",
-                    "fecha_tramite": fecha_hoy,
-                },
-                fieldnames=compare_fieldnames,
-            )
-        except:
-            pass
+    responsable_final = "BOT CARNÉ SUCAMEC"
+    if transmitido_por_otro_worker:
+        _, _, worker_tag = _worker_identity()
+        responsable_final = f"BOT CARNÉ SUCAMEC {worker_tag} (revalidado)"
+    _registrar_estado_transmitido_en_comparacion(
+        logger,
+        compare_url,
+        compare_row_number,
+        compare_fieldnames,
+        fecha_hoy,
+        responsable=responsable_final,
+    )
 
     # Limpieza de temporales locales de upload solo cuando el flujo llegó a TRANSMITIDO.
     limpiar_cache_upload_tmp_por_dni(logger, dni)
