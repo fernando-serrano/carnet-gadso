@@ -25,7 +25,8 @@ from playwright.sync_api import sync_playwright
 from dotenv import load_dotenv
 
 
-BASE_DIR = Path(__file__).resolve().parent
+APP_DIR = Path(__file__).resolve().parent
+BASE_DIR = APP_DIR.parent
 load_dotenv(BASE_DIR / ".env")
 
 
@@ -5995,7 +5996,7 @@ def _run_worker_unit(
         env["CARNET_WORKER_ITEMS_FILE"] = worker_items_file
         env.setdefault("CARNET_WORKER_SKIP_PRECHECK", "1")
 
-    cmd = [sys.executable, str(BASE_DIR / "carnet_emision.py")]
+    cmd = [sys.executable, "-m", "app.carnet_emision"]
     logger.info(
         "[W%s] Iniciando worker de lote | run_id=%s | tile_enable=%s | tile_total=%s | tile_index=%s",
         worker_id,

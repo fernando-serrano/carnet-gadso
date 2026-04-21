@@ -13,7 +13,7 @@ for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss
 set RUN_LOG=logs\run_carnet_emision_%TS%.log
 
 echo [INFO] Guardando consola en %RUN_LOG%
-python carnet_emision.py >> "%RUN_LOG%" 2>&1
+python -m app.carnet_emision >> "%RUN_LOG%" 2>&1
 set EXIT_CODE=%ERRORLEVEL%
 
 if not "%EXIT_CODE%"=="0" (

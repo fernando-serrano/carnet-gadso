@@ -22,7 +22,8 @@ try:
 except ImportError:
     pd = None
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+APP_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = APP_DIR.parent
 load_dotenv(PROJECT_ROOT / ".env")
 
 # ====================== INTENTO DE IMPORTAR OCR (opcional) ======================
@@ -2775,7 +2776,7 @@ def _ejecutar_scheduled_multihilo_orquestador():
     lock_results = threading.Lock()
     results = []
 
-    base_cmd = [sys.executable, str(PROJECT_ROOT / "example.py")]
+    base_cmd = [sys.executable, "-m", "app.example"]
 
     def _make_worker_excel(worker_id: int, target_indices: set, tag: str) -> str:
         safe_tag = str(tag).replace(" ", "_")

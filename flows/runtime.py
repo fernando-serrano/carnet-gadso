@@ -4,7 +4,7 @@ from typing import Callable
 
 from playwright.sync_api import sync_playwright
 
-import carnet_emision as core
+from app import carnet_emision as core
 
 
 AccionAutenticada = Callable[[object, logging.Logger, str], None]

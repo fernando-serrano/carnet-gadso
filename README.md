@@ -24,14 +24,15 @@ Procesar registros pendientes desde hoja de comparacion hasta transmitirlos en b
 
 ## Estructura del proyecto
 
-- `carnet_emision.py`: flujo principal, orquestador y workers.
+- `app/carnet_emision.py`: flujo principal, orquestador y workers.
+- `app/carne_flow.py`: utilidades de apoyo.
+- `app/example.py`: flujo legacy/experimental conservado fuera de la raiz.
 - `flows/runtime.py`: runtime compartido para abrir sesion, autenticar y cerrar recursos.
 - `flows/login_flow.py`: bloque de autenticacion (login) aislado.
 - `flows/formulario_flow.py`: bloque de acceso a CREAR SOLICITUD aislado.
 - `flows/bandeja_flow.py`: bloque de acceso a BANDEJA DE EMISION aislado.
-- `carne_flow.py`: utilidades de apoyo.
 - `scripts/`: launchers reales y entrypoints segmentados.
-- `run_login_flow.py`, `run_formulario_flow.py`, `run_bandeja_flow.py`: wrappers compatibles hacia `scripts/`.
+- `INICIAR_CARNETS_SUCAMEC.bat`: launcher recomendado para usuarios.
 - `run_scheduled.bat`, `run_carnet_emision.bat`: wrappers compatibles hacia `scripts/`.
 - `docs/`: documentacion historica y notas de cambios.
 - `README.md`: documentacion funcional y tecnica.
@@ -42,6 +43,147 @@ Procesar registros pendientes desde hoja de comparacion hasta transmitirlos en b
 - `data/`: cache local y temporales.
 - `secrets/carnet-drive-bot.json`: credenciales de cuenta de servicio.
 - `test/`: scripts auxiliares.
+
+## Instalacion en un dispositivo nuevo
+
+Esta guia asume Windows y ejecucion desde la carpeta raiz del proyecto.
+
+### 1) Preparar requisitos base
+
+Instalar:
+
+- Python 3.11 o superior.
+- Git, si se descargara el proyecto desde repositorio.
+- Acceso al archivo de credenciales Google Drive/Sheets de la cuenta de servicio.
+
+Verificar Python:
+
+```bash
+python --version
+```
+
+### 2) Copiar o clonar el proyecto
+
+Ubicar el proyecto en cualquier ruta del equipo. No es necesario que sea la misma ruta del equipo original.
+
+Ejemplo:
+
+```bat
+cd C:\Automatizaciones
+git clone <URL_DEL_REPOSITORIO> CARNET-GADSO
+cd CARNET-GADSO
+```
+
+Si se copia manualmente, conservar la estructura de carpetas:
+
+```txt
+app/
+flows/
+scripts/
+data/
+secrets/
+INICIAR_CARNETS_SUCAMEC.bat
+requirements.txt
+```
+
+### 3) Crear entorno virtual
+
+```bat
+python -m venv .venv
+.venv\Scripts\activate
+python -m pip install --upgrade pip
+```
+
+### 4) Instalar dependencias Python
+
+```bash
+pip install -r requirements.txt
+```
+
+### 5) Instalar navegador de Playwright
+
+```bash
+python -m playwright install chromium
+```
+
+### 6) Configurar `.env`
+
+Crear `.env` desde la plantilla:
+
+```bat
+copy .env.example .env
+```
+
+Editar `.env` y completar:
+
+- Credenciales SEL: `TIPO_DOC`, `NUMERO_DOCUMENTO`, `USUARIO_SEL`, `CLAVE_SEL`.
+- Credenciales SELVA si aplica.
+- URLs de Google Sheets: `CARNET_GSHEET_URL`, `CARNET_GSHEET_COMPARE_URL`, `CARNET_GSHEET_THIRD_URL`.
+- Carpeta raiz de Drive: `DRIVE_ROOT_FOLDER_ID`.
+
+Mantener rutas relativas para que el proyecto sea portable:
+
+```env
+EXCEL_PATH=data/programaciones-armas.xlsx
+LOG_DIR=logs
+DRIVE_CREDENTIALS_JSON=secrets/carnet-drive-bot.json
+```
+
+### 7) Instalar credenciales Google
+
+Crear la carpeta `secrets` si no existe:
+
+```bat
+mkdir secrets
+```
+
+Colocar el JSON de la cuenta de servicio en:
+
+```txt
+secrets/carnet-drive-bot.json
+```
+
+La cuenta de servicio debe tener permisos sobre:
+
+- Las hojas de Google Sheets usadas por el flujo.
+- La carpeta raiz de Drive indicada en `DRIVE_ROOT_FOLDER_ID`.
+
+### 8) Validar acceso antes de operar
+
+Con el entorno virtual activo:
+
+```bat
+set DRIVE_VALIDATE_ONLY=1
+python -m app.carnet_emision
+set DRIVE_VALIDATE_ONLY=
+```
+
+Para probar solo login:
+
+```bat
+python scripts/run_login_flow.py --grupo JV
+```
+
+### 9) Ejecutar el flujo programado
+
+La opcion recomendada es:
+
+```bat
+run_scheduled.bat
+```
+
+Cada corrida genera logs en:
+
+```txt
+logs/runs/scheduled_<timestamp>/
+```
+
+### 10) Notas de portabilidad
+
+- No usar rutas absolutas tipo `C:\Users\...` dentro de `.env`.
+- El codigo resuelve rutas relativas desde la raiz del proyecto.
+- `INICIAR_CARNETS_SUCAMEC.bat` y `run_scheduled.bat` pueden quedarse en la raiz y delegan la ejecucion real a `scripts/run_scheduled.bat`.
+- Si se mueve el proyecto a otra carpeta o equipo, solo deben acompañarlo `.env` y `secrets/carnet-drive-bot.json`.
 
 ## Arquitectura real de ejecucion
 
@@ -252,13 +394,6 @@ CARNET_GSHEET_RETRY_BASE_MS=800
 CARNET_OCR_MAX_INTENTOS=6
 ```
 
-## Instalacion
-
-```bash
-pip install -r requirements.txt
-python -m playwright install chromium
-```
-
 ## Ejecucion segmentada por funcionalidad
 
 Permite revisar y depurar un dominio especifico sin lanzar todo el flujo transaccional.
@@ -266,24 +401,18 @@ Permite revisar y depurar un dominio especifico sin lanzar todo el flujo transac
 ### 1) Solo login
 
 ```bash
-python run_login_flow.py --grupo JV
-# o:
 python scripts/run_login_flow.py --grupo JV
 ```
 
 ### 2) Login + acceso a formulario
 
 ```bash
-python run_formulario_flow.py --grupo JV
-# o:
 python scripts/run_formulario_flow.py --grupo JV
 ```
 
 ### 3) Login + acceso a bandeja
 
 ```bash
-python run_bandeja_flow.py --grupo JV
-# o:
 python scripts/run_bandeja_flow.py --grupo JV
 ```
 
@@ -298,7 +427,7 @@ Opciones utiles:
 ### Opcion recomendada (scheduled multihilo)
 
 ```bat
-run_scheduled.bat
+INICIAR_CARNETS_SUCAMEC.bat
 ```
 
 ### Opcion basica
@@ -310,7 +439,7 @@ run_carnet_emision.bat
 ### Opcion directa
 
 ```bash
-python carnet_emision.py
+python -m app.carnet_emision
 ```
 
 ## Modos especiales

@@ -8,7 +8,7 @@ from urllib.request import Request, urlopen
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
 
-from carnet_emision import (
+from app.carnet_emision import (
     CREDENCIALES_JV,
     CREDENCIALES_SELVA,
     DEFAULT_GSHEET_COMPARE_URL,
@@ -36,7 +36,8 @@ from carnet_emision import (
 )
 
 
-BASE_DIR = Path(__file__).resolve().parent
+APP_DIR = Path(__file__).resolve().parent
+BASE_DIR = APP_DIR.parent
 load_dotenv(BASE_DIR / ".env")
 STAGING_DIR = BASE_DIR / "logs" / ".cache_carne_flow"
 

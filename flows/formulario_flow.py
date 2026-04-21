@@ -1,6 +1,6 @@
 import argparse
 
-import carnet_emision as core
+from app import carnet_emision as core
 
 from .runtime import ejecutar_con_sesion_autenticada
 
