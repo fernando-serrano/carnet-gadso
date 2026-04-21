@@ -20,22 +20,35 @@ from urllib.request import Request, urlopen
 import unicodedata
 import importlib
 
-from dotenv import load_dotenv
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
+from dotenv import load_dotenv
 
-
-load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+
+
+def _resolve_project_path(raw: str | os.PathLike | None, default_path: Path | None = None) -> Path:
+    value = str(raw or "").strip()
+    if not value:
+        if default_path is None:
+            raise ValueError("No se recibio una ruta para resolver")
+        return default_path
+    p = Path(value).expanduser()
+    return p if p.is_absolute() else (BASE_DIR / p)
 
 
 def _resolve_dir_from_env(env_name: str, default_dir: Path) -> Path:
     raw = str(os.getenv(env_name, "") or "").strip()
+    return _resolve_project_path(raw, default_dir)
+
+
+def _resolve_file_from_env(env_name: str, default_file: str = "") -> Path | None:
+    raw = str(os.getenv(env_name, default_file) or "").strip()
     if not raw:
-        return default_dir
-    p = Path(raw)
-    return p if p.is_absolute() else (BASE_DIR / p)
+        return None
+    return _resolve_project_path(raw)
 
 
 LOGS_DIR = _resolve_dir_from_env("LOG_DIR", BASE_DIR / "logs")
@@ -480,9 +493,22 @@ def _detect_windows_screen_size(default_w: int = 1920, default_h: int = 1080):
 
 
 def _build_launch_args_for_window() -> list:
+    keep_visible = _as_bool_env("BROWSER_KEEP_VISIBLE", default=True)
+    visibility_args = []
+    if keep_visible:
+        # Evita throttling/backgrounding cuando la ventana queda ocluida o pierde foco.
+        visibility_args = [
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            "--disable-features=CalculateNativeWinOcclusion",
+        ]
+
     tile_enabled = _as_bool_env("BROWSER_TILE_ENABLE", default=False)
     if not tile_enabled:
-        return ["--disable-infobars", "--start-maximized", "--window-size=1920,1080", "--window-position=0,0"]
+        launch_args = ["--disable-infobars", *visibility_args]
+        if _as_bool_env("BROWSER_START_MAXIMIZED", default=False):
+            launch_args.append("--start-maximized")
+        return launch_args
 
     tile_total = max(1, _safe_int_env("BROWSER_TILE_TOTAL", 1))
     tile_index = _safe_int_env("BROWSER_TILE_INDEX", 0)
@@ -514,6 +540,7 @@ def _build_launch_args_for_window() -> list:
         "--disable-infobars",
         f"--window-size={tile_w},{tile_h}",
         f"--window-position={tile_x},{tile_y}",
+        *visibility_args,
     ]
 
 
@@ -1046,12 +1073,12 @@ def _google_sheets_service():
     except Exception as exc:
         raise Exception("Faltan dependencias de Google Sheets API. Instala google-api-python-client y google-auth") from exc
 
-    credentials_path = str(os.getenv("DRIVE_CREDENTIALS_JSON", DEFAULT_DRIVE_CREDENTIALS_JSON) or "").strip()
-    if not credentials_path:
+    credentials_path = _resolve_file_from_env("DRIVE_CREDENTIALS_JSON", DEFAULT_DRIVE_CREDENTIALS_JSON)
+    if credentials_path is None:
         raise Exception("Falta DRIVE_CREDENTIALS_JSON en .env")
 
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    creds = service_account.Credentials.from_service_account_file(credentials_path, scopes=scopes)
+    creds = service_account.Credentials.from_service_account_file(str(credentials_path), scopes=scopes)
     return google_build("sheets", "v4", credentials=creds, cache_discovery=False)
 
 
@@ -4535,12 +4562,12 @@ def _drive_service():
     except Exception as exc:
         raise Exception("Faltan dependencias de Google Drive API. Instala google-api-python-client y google-auth") from exc
 
-    credentials_path = str(os.getenv("DRIVE_CREDENTIALS_JSON", DEFAULT_DRIVE_CREDENTIALS_JSON) or "").strip()
-    if not credentials_path:
+    credentials_path = _resolve_file_from_env("DRIVE_CREDENTIALS_JSON", DEFAULT_DRIVE_CREDENTIALS_JSON)
+    if credentials_path is None:
         raise Exception("Falta DRIVE_CREDENTIALS_JSON en .env")
 
     scopes = ["https://www.googleapis.com/auth/drive.readonly"]
-    creds = service_account.Credentials.from_service_account_file(credentials_path, scopes=scopes)
+    creds = service_account.Credentials.from_service_account_file(str(credentials_path), scopes=scopes)
     return google_build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
@@ -4573,6 +4600,26 @@ def _drive_find_child_folder(service, parent_id: str, folder_name: str) -> dict 
     return None
 
 
+def _drive_find_folder_by_name_bfs(service, root_children: list[dict], folder_name: str, max_depth: int) -> dict | None:
+    target = _normalizar_columna(folder_name)
+    queue_items = [
+        (item, 1)
+        for item in root_children
+        if item.get("mimeType") == "application/vnd.google-apps.folder"
+    ]
+
+    while queue_items:
+        current, depth = queue_items.pop(0)
+        if _normalizar_columna(current.get("name", "")) == target:
+            return current
+        if depth >= max_depth:
+            continue
+        for child in _drive_list_children(service, current["id"]):
+            if child.get("mimeType") == "application/vnd.google-apps.folder":
+                queue_items.append((child, depth + 1))
+    return None
+
+
 def _drive_find_dni_folder(service, root_folder_id: str, dni: str) -> dict | None:
     root_children = _drive_list_children(service, root_folder_id)
     # Primero intenta encontrar el DNI directamente bajo la raíz.
@@ -4593,20 +4640,10 @@ def _drive_find_dni_folder(service, root_folder_id: str, dni: str) -> dict | Non
                 if item.get("mimeType") == "application/vnd.google-apps.folder" and _normalizar_columna(item.get("name", "")) == target:
                     return item
 
-    # Fallback robusto: busca el DNI en subcarpetas de hasta 2 niveles
-    # para soportar historicos en anyo/mes distinto al actual.
-    for level1 in root_children:
-        if level1.get("mimeType") != "application/vnd.google-apps.folder":
-            continue
-        for level2 in _drive_list_children(service, level1["id"]):
-            if level2.get("mimeType") != "application/vnd.google-apps.folder":
-                continue
-            if _normalizar_columna(level2.get("name", "")) == target:
-                return level2
-            for level3 in _drive_list_children(service, level2["id"]):
-                if level3.get("mimeType") == "application/vnd.google-apps.folder" and _normalizar_columna(level3.get("name", "")) == target:
-                    return level3
-    return None
+    # Fallback robusto: busca el DNI en subcarpetas para soportar historicos
+    # en anyo/mes distinto al actual, o un nivel adicional tipo anyo/mes/expedientes/DNI.
+    max_depth = max(3, _safe_int_env("CARNET_DRIVE_SEARCH_MAX_DEPTH", 4))
+    return _drive_find_folder_by_name_bfs(service, root_children, dni, max_depth=max_depth)
 
 
 def _drive_list_document_names(service, folder_id: str) -> list[str]:
@@ -5918,16 +5955,37 @@ def _run_worker_unit(
     run_id: str,
     logger: logging.Logger,
     worker_items_file: str = "",
+    tile_total: int | None = None,
+    tile_index: int | None = None,
 ) -> int:
     env = os.environ.copy()
     env["MULTIWORKER_CHILD"] = "1"
     env["WORKER_ID"] = str(worker_id)
     env["WORKER_RUN_ID"] = run_id
     env["CARNET_ROW_BY_ROW"] = "1"
+    env["CARNET_HEADLESS"] = env.get("CARNET_HEADLESS", "1")
+    env["BROWSER_KEEP_VISIBLE"] = env.get("BROWSER_KEEP_VISIBLE", "0")
     env["CARNET_WORKER_MAX_ROWS"] = str(_safe_int_env("CARNET_WORKER_MAX_ROWS", 0))
-    env["BROWSER_TILE_ENABLE"] = "1"
-    env["BROWSER_TILE_TOTAL"] = str(workers)
-    env["BROWSER_TILE_INDEX"] = str(worker_id - 1)
+    tile_enabled = str(env.get("BROWSER_TILE_ENABLE", "0") or "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "si",
+        "sí",
+        "on",
+    }
+    if tile_enabled:
+        env["BROWSER_TILE_ENABLE"] = "1"
+        total = max(1, int(tile_total if tile_total is not None else workers))
+        index = int(tile_index if tile_index is not None else (worker_id - 1))
+        if index < 0:
+            index = 0
+        if index >= total:
+            index = total - 1
+        env["BROWSER_TILE_TOTAL"] = str(total)
+        env["BROWSER_TILE_INDEX"] = str(index)
+    else:
+        env["BROWSER_TILE_ENABLE"] = "0"
     env["BROWSER_TILE_SCREEN_W"] = str(_safe_int_env("BROWSER_TILE_SCREEN_W", screen_w_eff))
     env["BROWSER_TILE_SCREEN_H"] = str(_safe_int_env("BROWSER_TILE_SCREEN_H", screen_h_eff))
     env["BROWSER_TILE_TOP_OFFSET"] = str(_safe_int_env("BROWSER_TILE_TOP_OFFSET", 0))
@@ -5938,7 +5996,14 @@ def _run_worker_unit(
         env.setdefault("CARNET_WORKER_SKIP_PRECHECK", "1")
 
     cmd = [sys.executable, str(BASE_DIR / "carnet_emision.py")]
-    logger.info("[W%s] Iniciando worker de lote | run_id=%s", worker_id, run_id)
+    logger.info(
+        "[W%s] Iniciando worker de lote | run_id=%s | tile_enable=%s | tile_total=%s | tile_index=%s",
+        worker_id,
+        run_id,
+        env.get("BROWSER_TILE_ENABLE", "0"),
+        env.get("BROWSER_TILE_TOTAL", "-"),
+        env.get("BROWSER_TILE_INDEX", "-"),
+    )
 
     proc = subprocess.run(
         cmd,
@@ -6024,10 +6089,18 @@ def _ejecutar_scheduled_multihilo_orquestador() -> int:
         logger.info("Sin unidades con trabajo para workers; fin de corrida")
         return 0
 
+    for idx, unit in enumerate(units):
+        try:
+            unit["visual_index"] = idx
+        except Exception:
+            pass
+
+    active_units = len(units)
+
     logger.info(
         "SCHEDULED_MULTIWORKER activado | workers=%s | units=%s | run_id=%s | pantalla_efectiva=%sx%s",
         workers,
-        len(units),
+        active_units,
         run_id,
         screen_w_eff,
         screen_h_eff,
@@ -6037,6 +6110,7 @@ def _ejecutar_scheduled_multihilo_orquestador() -> int:
     def worker_loop(unit: dict):
         worker_id = int(unit.get("worker_id", 0) or 0)
         worker_items_file = str(unit.get("items_file", "") or "")
+        visual_index = int(unit.get("visual_index", 0) or 0)
         code = _run_worker_unit(
             worker_id,
             workers,
@@ -6045,6 +6119,8 @@ def _ejecutar_scheduled_multihilo_orquestador() -> int:
             run_id,
             logger,
             worker_items_file=worker_items_file,
+            tile_total=active_units,
+            tile_index=visual_index,
         )
         results.append({"worker": worker_id, "exit_code": code})
 

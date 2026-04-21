@@ -36,9 +36,8 @@ from carnet_emision import (
 )
 
 
-load_dotenv()
-
 BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
 STAGING_DIR = BASE_DIR / "logs" / ".cache_carne_flow"
 
 

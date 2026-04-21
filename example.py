@@ -5,6 +5,8 @@ import queue
 import traceback
 import threading
 import subprocess
+from pathlib import Path
+
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 import time
@@ -20,7 +22,8 @@ try:
 except ImportError:
     pd = None
 
-load_dotenv()
+PROJECT_ROOT = Path(__file__).resolve().parent
+load_dotenv(PROJECT_ROOT / ".env")
 
 # ====================== INTENTO DE IMPORTAR OCR (opcional) ======================
 OCR_AVAILABLE = False
@@ -50,13 +53,13 @@ except Exception as e:
     print(f"[WARNING] Error al cargar easyocr: {e} -> modo MANUAL")
 
 URL_LOGIN = "https://www.sucamec.gob.pe/sel/faces/login.xhtml?faces-redirect=true"
-script_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.dirname(script_dir)
+project_root = str(PROJECT_ROOT)
 excel_path_env = os.getenv("EXCEL_PATH", "").strip()
 if excel_path_env:
-    EXCEL_PATH = excel_path_env if os.path.isabs(excel_path_env) else os.path.join(project_root, excel_path_env)
+    excel_path = Path(excel_path_env).expanduser()
+    EXCEL_PATH = str(excel_path if excel_path.is_absolute() else PROJECT_ROOT / excel_path)
 else:
-    EXCEL_PATH = os.path.join(project_root, "data", "programaciones-armas.xlsx")
+    EXCEL_PATH = str(PROJECT_ROOT / "data" / "programaciones-armas.xlsx")
 
 CREDENCIALES = {
     "tipo_documento_valor": os.getenv("TIPO_DOC", "RUC"),
@@ -2716,7 +2719,7 @@ def _multihilo_scheduled_habilitado() -> bool:
 def _ejecutar_scheduled_multihilo_orquestador():
     """
     Orquesta el modo scheduled multihilo ejecutando el flujo existente en procesos aislados.
-    No altera la lógica de negocio del flujo por registro: cada worker invoca run_pipeline.py.
+    No altera la lógica de negocio del flujo por registro: cada worker invoca este script.
     """
     if pd is None:
         raise Exception("pandas no está disponible para preparar lotes multihilo")
@@ -2772,7 +2775,7 @@ def _ejecutar_scheduled_multihilo_orquestador():
     lock_results = threading.Lock()
     results = []
 
-    base_cmd = [sys.executable, os.path.join(project_root, "run_pipeline.py"), "--mode", "scheduled"]
+    base_cmd = [sys.executable, str(PROJECT_ROOT / "example.py")]
 
     def _make_worker_excel(worker_id: int, target_indices: set, tag: str) -> str:
         safe_tag = str(tag).replace(" ", "_")

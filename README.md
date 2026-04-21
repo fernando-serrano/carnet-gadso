@@ -25,11 +25,19 @@ Procesar registros pendientes desde hoja de comparacion hasta transmitirlos en b
 ## Estructura del proyecto
 
 - `carnet_emision.py`: flujo principal, orquestador y workers.
+- `flows/runtime.py`: runtime compartido para abrir sesion, autenticar y cerrar recursos.
+- `flows/login_flow.py`: bloque de autenticacion (login) aislado.
+- `flows/formulario_flow.py`: bloque de acceso a CREAR SOLICITUD aislado.
+- `flows/bandeja_flow.py`: bloque de acceso a BANDEJA DE EMISION aislado.
 - `carne_flow.py`: utilidades de apoyo.
-- `run_scheduled.bat`: launcher recomendado para scheduled multihilo.
-- `run_carnet_emision.bat`: launcher basico.
+- `scripts/`: launchers reales y entrypoints segmentados.
+- `run_login_flow.py`, `run_formulario_flow.py`, `run_bandeja_flow.py`: wrappers compatibles hacia `scripts/`.
+- `run_scheduled.bat`, `run_carnet_emision.bat`: wrappers compatibles hacia `scripts/`.
+- `docs/`: documentacion historica y notas de cambios.
 - `README.md`: documentacion funcional y tecnica.
-- `requirements.md`: dependencias Python.
+- `requirements.txt`: dependencias Python instalables.
+- `requirements.md`: listado simple de dependencias, mantenido por compatibilidad.
+- `.env.example`: plantilla portable sin secretos ni rutas locales absolutas.
 - `logs/`: logs de ejecucion.
 - `data/`: cache local y temporales.
 - `secrets/carnet-drive-bot.json`: credenciales de cuenta de servicio.
@@ -182,8 +190,18 @@ Esto se logra configurando `LOG_DIR` por corrida antes de ejecutar Python.
 - `RUN_MODE=scheduled`
 - `SCHEDULED_MULTIWORKER=1`
 - `SCHEDULED_WORKERS=4`
+- `SCHEDULED_PRELOAD_ITEMS_FOR_WORKERS=1` (si hay pocos registros, solo se levantan workers con trabajo)
 - `CARNET_WORKER_SCAN_ROWS=200`
 - `CARNET_WORKER_MAX_ROWS=0`
+
+### Ventanas de workers (Windows)
+
+- `CARNET_HEADLESS=1` para ejecutar sin mostrar ventanas de navegador.
+- `CARNET_HEADLESS=0` para ejecutar con navegador visible solo cuando se necesite depurar.
+- `BROWSER_TILE_ENABLE=1` para distribuir ventanas en mosaico.
+- `BROWSER_TILE_ENABLE=0` para desactivar mosaico y evitar redimensionamiento/posicionamiento forzado.
+- `BROWSER_START_MAXIMIZED=1` para maximizar ventanas visibles cuando el mosaico esta desactivado.
+- Con precarga activa (`SCHEDULED_PRELOAD_ITEMS_FOR_WORKERS=1`), la cantidad de ventanas visibles depende de `workers_activos` (workers con items realmente asignados), no solo de `SCHEDULED_WORKERS`.
 
 ### Robustez de lectura y UI
 
@@ -207,7 +225,8 @@ Esto se logra configurando `LOG_DIR` por corrida antes de ejecutar Python.
 - `CARNET_GSHEET_COMPARE_URL`
 - `CARNET_GSHEET_THIRD_URL`
 - `DRIVE_ROOT_FOLDER_ID`
-- `DRIVE_CREDENTIALS_JSON`
+- `DRIVE_CREDENTIALS_JSON` (puede ser relativa al proyecto, por ejemplo `secrets/carnet-drive-bot.json`)
+- `CARNET_DRIVE_SEARCH_MAX_DEPTH=4` para buscar expedientes historicos en estructuras como `2026/04/DNI` o `2026/04/expedientes/DNI`.
 
 ### Estado y cierre
 
@@ -236,9 +255,43 @@ CARNET_OCR_MAX_INTENTOS=6
 ## Instalacion
 
 ```bash
-pip install -r requirements.md
+pip install -r requirements.txt
 python -m playwright install chromium
 ```
+
+## Ejecucion segmentada por funcionalidad
+
+Permite revisar y depurar un dominio especifico sin lanzar todo el flujo transaccional.
+
+### 1) Solo login
+
+```bash
+python run_login_flow.py --grupo JV
+# o:
+python scripts/run_login_flow.py --grupo JV
+```
+
+### 2) Login + acceso a formulario
+
+```bash
+python run_formulario_flow.py --grupo JV
+# o:
+python scripts/run_formulario_flow.py --grupo JV
+```
+
+### 3) Login + acceso a bandeja
+
+```bash
+python run_bandeja_flow.py --grupo JV
+# o:
+python scripts/run_bandeja_flow.py --grupo JV
+```
+
+Opciones utiles:
+
+- `--grupo SELVA` para probar credenciales del segundo grupo.
+- `--keep-open` para dejar la sesion abierta al final.
+- `CARNET_BANDEJA_ESTADO_OBJETIVO=CREADO` para aplicar filtro de estado al entrar a bandeja.
 
 ## Ejecucion
 
@@ -270,7 +323,7 @@ python carnet_emision.py
 
 1. Habilitar Google Sheets API para la cuenta de servicio.
 2. Compartir las hojas con el `client_email` de la cuenta con rol Editor.
-3. Configurar ruta valida en `DRIVE_CREDENTIALS_JSON`.
+3. Configurar ruta valida en `DRIVE_CREDENTIALS_JSON`. Se recomienda ruta relativa: `secrets/carnet-drive-bot.json`.
 
 ## Resumen operativo
 

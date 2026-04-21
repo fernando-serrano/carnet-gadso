@@ -1,0 +1,7 @@
+python-dotenv==1.1.0
+playwright==1.51.0
+pillow==11.1.0
+numpy==2.2.4
+easyocr==1.7.2
+google-api-python-client==2.166.0
+google-auth==2.38.0
