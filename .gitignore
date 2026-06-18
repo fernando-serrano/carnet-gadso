@@ -15,6 +15,10 @@ logs/
 # IDE
 .vscode/
 .idea/
+.claude/
+
+# Cache de subidas (temporales por DNI)
+data/cache/
 
 # OS
 .DS_Store

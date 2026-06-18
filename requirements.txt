@@ -5,3 +5,4 @@ numpy==2.2.4
 easyocr==1.7.2
 google-api-python-client==2.166.0
 google-auth==2.38.0
+pikepdf ==7.3.0

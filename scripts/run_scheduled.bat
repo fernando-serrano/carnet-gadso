@@ -4,6 +4,9 @@ setlocal
 set PROJECT_ROOT=%~dp0..
 cd /d "%PROJECT_ROOT%"
 
+set "PY=%CD%\.venv\Scripts\python.exe"
+if not exist "%PY%" set "PY=python"
+
 if not exist "logs" mkdir "logs"
 if not exist "data" mkdir "data"
 if not exist "test" mkdir "test"
@@ -30,7 +33,8 @@ echo [INFO] RUN_MODE=%RUN_MODE% SCHEDULED_MULTIWORKER=%SCHEDULED_MULTIWORKER% SC
 echo [INFO] CARNET_HEADLESS=%CARNET_HEADLESS% BROWSER_KEEP_VISIBLE=%BROWSER_KEEP_VISIBLE% BROWSER_TILE_ENABLE=%BROWSER_TILE_ENABLE%
 echo [INFO] Guardando consola en %RUN_LOG%
 
-python -m app.carnet_emision >> "%RUN_LOG%" 2>&1
+echo [INFO] Python: %PY%
+"%PY%" -m app.carnet_emision >> "%RUN_LOG%" 2>&1
 set EXIT_CODE=%ERRORLEVEL%
 
 if not "%EXIT_CODE%"=="0" (

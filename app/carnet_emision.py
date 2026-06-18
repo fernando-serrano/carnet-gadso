@@ -3354,13 +3354,17 @@ def _registrar_estado_en_transmision_en_comparacion(
 
     try:
         _, _, worker_tag = _worker_identity()
+        # Trazabilidad intermedia: marcamos ESTADO_TRAMITE=EN TRANSMISION pero
+        # NO tocamos OBSERVACION. La OBSERVACION solo la escribe la finalización
+        # ("Transmitido sin observaciones"); así, ante una carrera de escrituras
+        # entre workers concurrentes, la OBSERVACION nunca queda atascada en el
+        # valor intermedio "SOLICITUD EN TRANSMISION" si el ESTADO ya llegó a
+        # TRANSMITIDO.
         _actualizar_fila_comparacion_por_row(
             logger,
             compare_url,
             compare_row_number,
             {
-                "observacion": "SOLICITUD EN TRANSMISION",
-                "observación": "SOLICITUD EN TRANSMISION",
                 "estado_tramite": "EN TRANSMISION",
                 "estado tramite": "EN TRANSMISION",
                 "responsable": f"BOT CARNÉ SUCAMEC {worker_tag}",
@@ -3391,14 +3395,20 @@ def _registrar_estado_transmitido_en_comparacion(
         or "Transmitido sin observaciones"
     ).strip()
     try:
+        # Escritura final autoritativa: cubrimos variantes de encabezado
+        # (con/sin acento, espacio o guion bajo) para garantizar que OBSERVACION,
+        # ESTADO_TRAMITE y FECHA queden con su valor definitivo en una sola pasada.
         _actualizar_fila_comparacion_por_row(
             logger,
             compare_url,
             compare_row_number,
             {
                 "observacion": observacion_post,
+                "observación": observacion_post,
                 "estado_tramite": estado_post,
+                "estado tramite": estado_post,
                 "responsable": str(responsable or "BOT CARNÉ SUCAMEC"),
+                "fecha tramite": str(fecha_tramite or "").strip(),
                 "fecha_tramite": str(fecha_tramite or "").strip(),
             },
             fieldnames=compare_fieldnames,
@@ -6112,23 +6122,42 @@ def _ejecutar_scheduled_multihilo_orquestador() -> int:
         worker_id = int(unit.get("worker_id", 0) or 0)
         worker_items_file = str(unit.get("items_file", "") or "")
         visual_index = int(unit.get("visual_index", 0) or 0)
-        code = _run_worker_unit(
-            worker_id,
-            workers,
-            screen_w_eff,
-            screen_h_eff,
-            run_id,
-            logger,
-            worker_items_file=worker_items_file,
-            tile_total=active_units,
-            tile_index=visual_index,
-        )
-        results.append({"worker": worker_id, "exit_code": code})
+        # Aislamiento por worker: si uno aborta por una excepción no controlada,
+        # se registra y el resto de workers sigue operando con normalidad.
+        try:
+            code = _run_worker_unit(
+                worker_id,
+                workers,
+                screen_w_eff,
+                screen_h_eff,
+                run_id,
+                logger,
+                worker_items_file=worker_items_file,
+                tile_total=active_units,
+                tile_index=visual_index,
+            )
+            results.append({"worker": worker_id, "exit_code": code})
+        except Exception as exc:
+            logger.exception(
+                "[W%s] Worker abortó por excepción no controlada; los demás workers continúan: %s",
+                worker_id,
+                exc,
+            )
+            results.append({"worker": worker_id, "exit_code": 1})
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futures = [ex.submit(worker_loop, unit) for unit in units]
         for f in futures:
-            f.result()
+            # worker_loop ya captura sus propias excepciones; este guard es
+            # defensa adicional para que un fallo al recoger un resultado no
+            # impida recoger los de los demás workers.
+            try:
+                f.result()
+            except Exception as exc:
+                logger.error(
+                    "Fallo inesperado al recoger el resultado de un worker; se continúa con los demás: %s",
+                    exc,
+                )
 
     failed = [r for r in results if int(r.get("exit_code", 1)) != 0]
     if failed:
