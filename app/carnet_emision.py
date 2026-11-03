@@ -134,7 +134,7 @@ SEL = {
     "bandeja_estado_trigger": '#listForm\\:tipoFormacion .ui-selectonemenu-trigger',
     "bandeja_estado_label": "#listForm\\:tipoFormacion_label",
     "bandeja_estado_panel": "#listForm\\:tipoFormacion_panel",
-    "bandeja_buscar_button": '#listForm\\:j_idt56, #listForm\\:btnBuscar, #listForm\\:botonBuscar, #listForm\\:buscar, button[id*="listForm"][id*="Buscar"]',
+    "bandeja_buscar_button": 'form[id="listForm"] button:has-text("Buscar")',
     "bandeja_resultados_tbody": "#listForm\\:dtResultados_data",
     "bandeja_select_all_checkbox": "#listForm\\:dtResultados .ui-chkbox-all .ui-chkbox-box, #listForm\\:dtResultados_head .ui-chkbox-all .ui-chkbox-box",
     "bandeja_transmitir_button": '#listForm\\:j_idt67, button[id*="listForm"][id*="j_idt67"], button:has-text("Transmitir")',
