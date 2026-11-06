@@ -416,6 +416,7 @@ def ejecutar_hasta_crear_solicitud(logger, registro: dict | None) -> int:
             raise Exception(f"Login fallido: {msg_error}")
 
         logger.info("[CARNE_FLOW] Login exitoso en %.2fs", tiempo)
+        cerrar_encuesta_overlay(page, logger, "CARNE_FLOW")
         navegar_dssp_carne_crear_solicitud(page, logger)
 
         vista_ok = validar_vista_crear_solicitud_por_ui(page, timeout_ms=3200)
@@ -473,3 +474,41 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def cerrar_encuesta_overlay(page, logger=None, grupo: str = "", wait_ms: int = 4000) -> bool:
+    """Cierra la encuesta de satisfaccion que SUCAMEC superpone en inicio.xhtml.
+
+    Tolerante: si no aparece no hace nada; nunca lanza excepcion.
+    """
+    def _log(nivel, msg, *args):
+        if logger is not None:
+            getattr(logger, nivel)(msg, *args)
+        else:
+            print(f"[{nivel.upper()}] " + (msg % args))
+
+    cerrar = page.locator(".encuesta-overlay-cerrar").first
+    try:
+        cerrar.wait_for(state="visible", timeout=wait_ms)
+    except Exception:
+        _log("info", "[%s] Encuesta overlay no presente, se continua", grupo)
+        return False
+    try:
+        cerrar.click(timeout=3000)
+        page.locator(".encuesta-modal").first.wait_for(state="hidden", timeout=3000)
+        _log("info", "[%s] Encuesta overlay cerrada con boton X", grupo)
+        return True
+    except Exception as exc:
+        _log("warning", "[%s] Clic en cerrar encuesta fallo (%s); forzando cierre por JS", grupo, exc)
+    try:
+        page.evaluate(
+            """() => {
+                try { if (typeof cerrarEncuestaOverlay === 'function') cerrarEncuestaOverlay(); } catch (e) {}
+                document.querySelectorAll('.encuesta-modal').forEach(el => el.remove());
+            }"""
+        )
+        _log("info", "[%s] Encuesta overlay removida por JS", grupo)
+        return True
+    except Exception as exc:
+        _log("warning", "[%s] No se pudo remover encuesta overlay: %s", grupo, exc)
+        return False
