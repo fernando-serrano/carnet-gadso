@@ -6177,10 +6177,6 @@ def main() -> int:
     return ejecutar_flujo_secundario()
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
-
-
 def cerrar_encuesta_overlay(page, logger=None, grupo: str = "", wait_ms: int = 4000) -> bool:
     """Cierra la encuesta de satisfaccion que SUCAMEC superpone en inicio.xhtml.
 
@@ -6217,3 +6213,7 @@ def cerrar_encuesta_overlay(page, logger=None, grupo: str = "", wait_ms: int = 4
     except Exception as exc:
         _log("warning", "[%s] No se pudo remover encuesta overlay: %s", grupo, exc)
         return False
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
