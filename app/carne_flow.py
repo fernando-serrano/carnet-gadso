@@ -416,6 +416,7 @@ def ejecutar_hasta_crear_solicitud(logger, registro: dict | None) -> int:
             raise Exception(f"Login fallido: {msg_error}")
 
         logger.info("[CARNE_FLOW] Login exitoso en %.2fs", tiempo)
+        cerrar_comunicado_horario_overlay(page, logger, "CARNE_FLOW")
         cerrar_encuesta_overlay(page, logger, "CARNE_FLOW")
         navegar_dssp_carne_crear_solicitud(page, logger)
 
@@ -474,6 +475,49 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+
+def cerrar_comunicado_horario_overlay(page, logger=None, grupo: str = "", wait_ms: int = 4000) -> bool:
+    """Cierra el comunicado institucional (.comunicado-horario-caja) que SUCAMEC superpone en inicio.xhtml.
+
+    Boton: <button class="comunicado-horario-cerrar" onclick="cerrarComunicadoHorarioOverlay(event)">.
+    Tolerante: si no aparece no hace nada; nunca lanza excepcion.
+    """
+    def _log(nivel, msg, *args):
+        if logger is not None:
+            getattr(logger, nivel)(msg, *args)
+        else:
+            print(f"[{nivel.upper()}] " + (msg % args))
+
+    cerrar = page.locator(".comunicado-horario-cerrar").first
+    try:
+        cerrar.wait_for(state="visible", timeout=wait_ms)
+    except Exception:
+        _log("info", "[%s] Comunicado horario no presente, se continua", grupo)
+        return False
+    try:
+        cerrar.click(timeout=3000)
+        page.locator(".comunicado-horario-caja").first.wait_for(state="hidden", timeout=3000)
+        _log("info", "[%s] Comunicado horario cerrado con boton X", grupo)
+        return True
+    except Exception as exc:
+        _log("warning", "[%s] Clic en cerrar comunicado fallo (%s); forzando cierre por JS", grupo, exc)
+    try:
+        page.evaluate(
+            """() => {
+                try { if (typeof cerrarComunicadoHorarioOverlay === 'function') cerrarComunicadoHorarioOverlay(new Event('click')); } catch (e) {}
+                document.querySelectorAll('.comunicado-horario-caja').forEach(el => {
+                    const capa = el.parentElement && el.parentElement !== document.body ? el.parentElement : el;
+                    capa.remove();
+                });
+            }"""
+        )
+        _log("info", "[%s] Comunicado horario removido por JS", grupo)
+        return True
+    except Exception as exc:
+        _log("warning", "[%s] No se pudo remover comunicado horario: %s", grupo, exc)
+        return False
 
 
 def cerrar_encuesta_overlay(page, logger=None, grupo: str = "", wait_ms: int = 4000) -> bool:
