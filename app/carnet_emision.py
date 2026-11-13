@@ -97,13 +97,14 @@ SEL = {
     "captcha_input": "#tabViewLogin\\:tradicionalForm\\:textoCaptcha",
     "boton_refresh": "#tabViewLogin\\:tradicionalForm\\:botonCaptcha",
     "ingresar": "#tabViewLogin\\:tradicionalForm\\:ingresar",
-    "menu_root": "#j_idt11\\:menuPrincipal, #j_idt11\\:menuprincipal",
+    # El prefijo JSF (j_idt11, j_idt12, ...) cambia entre despliegues de SUCAMEC: se busca por sufijo.
+    "menu_root": '[id$=":menuPrincipal"], [id$=":menuprincipal"]',
     "menu_header_dssp": '.ui-panelmenu-header:has(a:text-is("DSSP")), .ui-panelmenu-header:has(a:has-text("DSSP"))',
     "menu_item_carne": '.ui-menuitem-link:has(span.ui-menuitem-text:text-is("CARNÉ")), .ui-menuitem-link:has(span.ui-menuitem-text:text-is("CARNE")), .ui-menuitem-link:has(span.ui-menuitem-text:has-text("CARN"))',
     "menu_item_crear_solicitud": '.ui-menuitem-link:has(span.ui-menuitem-text:text-is("CREAR SOLICITUD")), .ui-menuitem-link:has(span.ui-menuitem-text:has-text("CREAR SOLICITUD"))',
-    "menu_item_crear_solicitud_onclick": 'a[onclick*="addSubmitParam"][onclick*="j_idt11:menuprincipal"]:has(span.ui-menuitem-text:text-is("CREAR SOLICITUD")), a[onclick*="addSubmitParam"][onclick*="j_idt11:menuPrincipal"]:has(span.ui-menuitem-text:text-is("CREAR SOLICITUD"))',
+    "menu_item_crear_solicitud_onclick": 'a[onclick*="addSubmitParam"][onclick*=":menuprincipal"]:has(span.ui-menuitem-text:text-is("CREAR SOLICITUD")), a[onclick*="addSubmitParam"][onclick*=":menuPrincipal"]:has(span.ui-menuitem-text:text-is("CREAR SOLICITUD"))',
     "menu_item_bandeja_emision": '.ui-menuitem-link:has(span.ui-menuitem-text:text-is("BANDEJA DE EMISIÓN")), .ui-menuitem-link:has(span.ui-menuitem-text:text-is("BANDEJA DE EMISION")), .ui-menuitem-link:has(span.ui-menuitem-text:has-text("BANDEJA DE EMIS"))',
-    "menu_item_bandeja_emision_onclick": 'a[onclick*="addSubmitParam"][onclick*="j_idt11:menuprincipal"]:has(span.ui-menuitem-text:text-is("BANDEJA DE EMISIÓN")), a[onclick*="addSubmitParam"][onclick*="j_idt11:menuprincipal"]:has(span.ui-menuitem-text:text-is("BANDEJA DE EMISION")), a[onclick*="addSubmitParam"][onclick*="j_idt11:menuPrincipal"]:has(span.ui-menuitem-text:text-is("BANDEJA DE EMISIÓN")), a[onclick*="addSubmitParam"][onclick*="j_idt11:menuPrincipal"]:has(span.ui-menuitem-text:text-is("BANDEJA DE EMISION"))',
+    "menu_item_bandeja_emision_onclick": 'a[onclick*="addSubmitParam"][onclick*=":menuprincipal"]:has(span.ui-menuitem-text:text-is("BANDEJA DE EMISIÓN")), a[onclick*="addSubmitParam"][onclick*=":menuprincipal"]:has(span.ui-menuitem-text:text-is("BANDEJA DE EMISION")), a[onclick*="addSubmitParam"][onclick*=":menuPrincipal"]:has(span.ui-menuitem-text:text-is("BANDEJA DE EMISIÓN")), a[onclick*="addSubmitParam"][onclick*=":menuPrincipal"]:has(span.ui-menuitem-text:text-is("BANDEJA DE EMISION"))',
     "crear_solicitud_sede_trigger": '#createForm\\:dondeRecoger .ui-selectonemenu-trigger',
     "crear_solicitud_sede_label": '#createForm\\:dondeRecoger_label',
     "crear_solicitud_sede_panel": '#createForm\\:dondeRecoger_panel',
@@ -137,14 +138,14 @@ SEL = {
     "bandeja_buscar_button": 'form[id="listForm"] button:has-text("Buscar")',
     "bandeja_resultados_tbody": "#listForm\\:dtResultados_data",
     "bandeja_select_all_checkbox": "#listForm\\:dtResultados .ui-chkbox-all .ui-chkbox-box, #listForm\\:dtResultados_head .ui-chkbox-all .ui-chkbox-box",
-    "bandeja_transmitir_button": '#listForm\\:j_idt67, button[id*="listForm"][id*="j_idt67"], button:has-text("Transmitir")',
+    # Sin ids j_idtNN: en 2026-11 j_idt67 pasó a ser la etiqueta "Cambiar:" y el botón es j_idt68.
+    "bandeja_transmitir_button": 'form#listForm button:has(span.ui-button-text:text-is("Transmitir")), form#listForm button:has-text("Transmitir")',
     "bandeja_transmitir_confirm_dialog": "#dlgCompletarProceso",
-    "bandeja_transmitir_confirm_button": '#frmCompletarProceso\\:j_idt418, #dlgCompletarProceso button#frmCompletarProceso\\:j_idt418, #dlgCompletarProceso button:has(span.ui-button-text:text-is("Transmitir"))',
+    "bandeja_transmitir_confirm_button": '#dlgCompletarProceso button:has(span.ui-button-text:text-is("Transmitir")), #dlgCompletarProceso button:has-text("Transmitir")',
 }
 
 SUCCESS_SELECTORS = [
-    "#j_idt11\\:menuPrincipal",
-    "#j_idt11\\:j_idt18",
+    '[id$=":menuPrincipal"]',
     "form#gestionCitasForm",
 ]
 
@@ -635,7 +636,7 @@ def pagina_muestra_servicio_no_disponible(page) -> bool:
     selectores_ok = [
         SEL["tab_tradicional"],
         SEL["numero_documento"],
-        "#j_idt11\\:menuPrincipal",
+        '[id$=":menuPrincipal"]',
         "form#gestionCitasForm",
     ]
     for sel in selectores_ok:
@@ -2346,8 +2347,10 @@ def ingresar_copia_secuencia_pago(page, valor_secuencia: str) -> None:
 
 def _leer_src_preview_foto(page) -> str:
     """Obtiene el src actual del preview de foto en el formulario, si existe."""
+    # El preview cambia de id entre despliegues (j_idt77 -> j_idt85 en 2026-11) y ya no
+    # trae width/height: se ubica por el src dinámico de PrimeFaces.
     selectores = [
-        '#createForm\\:j_idt77',
+        'img[id^="createForm:"][src*="dynamiccontent"]',
         'img[id^="createForm:"][width="150"][height="200"]',
     ]
     for selector in selectores:
@@ -2363,8 +2366,36 @@ def _leer_src_preview_foto(page) -> str:
     return ""
 
 
+def _leer_nombre_archivo_hermano(page, container_selector: str) -> str:
+    """Desde 2026-11 SUCAMEC muestra el archivo cargado en un <span class="carne-file-name">
+    hermano posterior al contenedor del fileupload (fuera de él)."""
+    try:
+        loc = page.locator(container_selector).first
+        if loc.count() == 0:
+            return ""
+        return str(
+            loc.evaluate(
+                """el => {
+                    let n = el.nextElementSibling;
+                    for (let i = 0; n && i < 4; i++, n = n.nextElementSibling) {
+                        if (n.classList && n.classList.contains('carne-file-name')) return (n.textContent || '').trim();
+                        if (n.id && n.id.endsWith('_input')) continue;
+                        if (n.classList && n.classList.contains('ui-fileupload')) break;
+                    }
+                    return '';
+                }"""
+            )
+            or ""
+        ).strip()
+    except Exception:
+        return ""
+
+
 def _leer_texto_upload_djfut(page) -> str:
     """Lee el texto visible del bloque de carga DJFUT."""
+    nombre = _leer_nombre_archivo_hermano(page, SEL["crear_solicitud_djfut_container"])
+    if nombre:
+        return nombre
     selectores = [
         SEL["crear_solicitud_djfut_container"],
         SEL["crear_solicitud_djfut_label"],
@@ -2384,6 +2415,9 @@ def _leer_texto_upload_djfut(page) -> str:
 
 def _leer_texto_upload_certificado_medico(page) -> str:
     """Lee el texto visible del bloque de carga del certificado médico."""
+    nombre = _leer_nombre_archivo_hermano(page, SEL["crear_solicitud_certificado_medico_container"])
+    if nombre:
+        return nombre
     selectores = [
         SEL["crear_solicitud_certificado_medico_container"],
         SEL["crear_solicitud_certificado_medico_label"],
@@ -3655,7 +3689,7 @@ def seleccionar_todos_resultados_bandeja(page, logger: logging.Logger) -> None:
     # Si no hay filas, no hay nada que transmitir.
     row_count = 0
     try:
-        row_count = tbody.locator("tr").count()
+        row_count = tbody.locator("tr:not(.ui-datatable-empty-message)").count()
     except Exception:
         row_count = 0
     if row_count <= 0:
@@ -5204,7 +5238,7 @@ def validar_vista_crear_solicitud_por_ui(page, timeout_ms: int = 6000) -> bool:
                 """() => {
                     const candidates = [
                         '.ui-layout-center',
-                        '#j_idt11\\:content',
+                        '[id$=":content"]',
                         '#contenido',
                         '#principal',
                         '#main',
